@@ -6,7 +6,7 @@
 
 **Tech Stack:** Rust, Axum, Tokio, serde_json, Foundry connector.
 
-**ADR:** [Foundry gateway architecture](../../adrs/0001-foundry-gateway-architecture.md)
+**ADR:** [Foundry gateway architecture](../../adr/0001-foundry-gateway-architecture.md)
 
 ## Constraints and review focus
 
