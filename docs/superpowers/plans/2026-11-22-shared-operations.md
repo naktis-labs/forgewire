@@ -6,7 +6,7 @@
 
 **Tech Stack:** Rust, Axum, Tokio, serde_json, Foundry connector.
 
-**Spec:** `docs/superpowers/specs/2026-11-22-functional-parity-adr.md`
+**ADR:** [Foundry gateway architecture](../../adrs/0001-foundry-gateway-architecture.md)
 
 ## Constraints and review focus
 
@@ -18,5 +18,5 @@ No live writes or commits without permission. Preserve dirty worktree. Test disa
 - [ ] Route MCP and existing REST world, collection and document writes through shared dispatch. Verify invalid requests and disabled writes through both transports.
 - [ ] Add REST access to shared document lookup/filter/projection, compendium reads and management, instance selection, file browsing and byte upload. Test successful and failing adapter equivalence with a fake backend.
 - [ ] Test an in-flight operation retains its original credential after concurrent instance selection.
-- [ ] Specify and implement URL fetching only with a defensible deployment egress boundary, destination validation and pinned connections, redirect and byte limits, and security tests. Until then document this as an open parity gap.
+- [ ] Record URL uploads as a deferred parity gap; design their egress/SSRF protections in a separate ADR before implementation.
 - [ ] Independently review authority, destructive and concurrency changes; run workspace tests, fmt, Clippy and diff checks; update capability matrix and README.
