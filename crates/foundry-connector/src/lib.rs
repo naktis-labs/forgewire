@@ -10,6 +10,10 @@ use tokio_tungstenite::{
 };
 use url::Url;
 
+pub mod compendium;
+pub mod files;
+pub mod read_ops;
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct FoundryCredential {
     pub id: Option<String>,
@@ -145,7 +149,111 @@ fn session_event(frame: &str) -> Option<Result<()>> {
     )
 }
 
-fn document_ack(frame: &str, id: u64, document: &str) -> Result<Option<Value>> {
+#[derive(Default)]
+struct DocumentOptions {
+    parent_uuid: Option<String>,
+    pack: Option<String>,
+}
+
+fn write_operation(
+    action: &str,
+    values: Value,
+    options: &DocumentOptions,
+    modified_time: u64,
+) -> Result<Value> {
+    let mut operation = json!({"action": action, "pack": options.pack, "modifiedTime": modified_time, "render": true});
+    match action {
+        "create" => {
+            operation["data"] = values;
+            operation["renderSheet"] = json!(true);
+        }
+        "update" => {
+            operation["updates"] = values;
+            operation["diff"] = json!(false);
+            operation["recursive"] = json!(true);
+        }
+        "delete" => {
+            operation["ids"] = values;
+            operation["deleteAll"] = json!(false);
+        }
+        _ => bail!("unsupported document action"),
+    }
+    if let Some(parent) = &options.parent_uuid {
+        operation["parentUuid"] = json!(parent);
+    }
+    Ok(operation)
+}
+
+fn validate_write_ack(response: &Value, action: &str, requested: &Value) -> Result<()> {
+    if response.get("action").and_then(Value::as_str) != Some(action) {
+        bail!("Foundry document response has unexpected action, and the operation may have been applied");
+    }
+    let result = response
+        .get("result")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            anyhow!("Foundry document response has invalid result, and the operation may have been applied")
+        })?;
+    let requested = requested
+        .as_array()
+        .ok_or_else(|| anyhow!("invalid document request"))?;
+    match action {
+        "create" => {
+            let mut seen = std::collections::HashSet::new();
+            for value in result {
+                let id = value.get("_id").and_then(Value::as_str);
+                let valid = id.is_some_and(|id| !id.trim().is_empty())
+                    && seen.insert(id.unwrap().to_owned());
+                if !valid {
+                    bail!("Foundry create response is incomplete, and the operation may have been applied");
+                }
+            }
+            if result.len() != requested.len() {
+                bail!("Foundry create response is incomplete, and the operation may have been applied");
+            }
+        }
+        "update" | "delete" => {
+            let mut seen = std::collections::HashSet::new();
+            for item in result {
+                let id = if action == "update" {
+                    item.get("_id").and_then(Value::as_str)
+                } else {
+                    item.as_str()
+                }
+                .filter(|id| !id.trim().is_empty())
+                .ok_or_else(|| {
+                    anyhow!("Foundry {action} response has malformed document id, and the operation may have been applied")
+                })?;
+                if !seen.insert(id.to_owned()) {
+                    bail!("Foundry {action} response has duplicate document id, and the operation may have been applied");
+                }
+            }
+            if seen.len() != requested.len() {
+                bail!("Foundry {action} response has unexpected document id, and the operation may have been applied");
+            }
+            for value in requested {
+                let id = if action == "update" {
+                    value.get("_id").and_then(Value::as_str)
+                } else {
+                    value.as_str()
+                }
+                .ok_or_else(|| anyhow!("invalid requested document id"))?;
+                if !seen.contains(id) {
+                    bail!("Foundry {action} response is missing requested document id, and the operation may have been applied");
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn document_ack_response(
+    frame: &str,
+    id: u64,
+    document: &str,
+    action: &str,
+) -> Result<Option<Value>> {
     let expected = format!("43{id}[");
     if !frame.starts_with(&expected) {
         return Ok(None);
@@ -156,24 +264,44 @@ fn document_ack(frame: &str, id: u64, document: &str) -> Result<Option<Value>> {
     let values: Value = serde_json::from_str(&frame[start..])
         .map_err(|_| anyhow!("invalid Foundry ACK payload"))?;
     let response = values.get(0).ok_or_else(|| anyhow!("empty Foundry ACK"))?;
-    if response.get("type").and_then(Value::as_str) != Some(document) {
+    if response
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind != document)
+    {
         return Ok(None);
     }
-    if let Some(error) = response.get("error") {
+    let applied = if action == "get" {
+        String::new()
+    } else {
+        ", and the operation may have been applied".to_string()
+    };
+    if let Some(error) = response.get("error").filter(|error| !error.is_null()) {
         bail!(
-            "Foundry document request failed: {}",
+            "Foundry document request failed{}: {}",
+            applied,
             error
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown error")
         );
     }
-    if !response.get("result").is_some_and(Value::is_array) {
+    if response.get("type").and_then(Value::as_str) != Some(document) {
         return Ok(None);
     }
-    Ok(response.get("result").cloned())
+    if !response.get("result").is_some_and(Value::is_array) {
+        bail!("Foundry document response has invalid result{applied}");
+    }
+    Ok(Some(response.clone()))
 }
 
+#[cfg(test)]
+fn document_ack(frame: &str, id: u64, document: &str) -> Result<Option<Value>> {
+    Ok(document_ack_response(frame, id, document, "get")?
+        .map(|response| response["result"].clone()))
+}
+
+#[cfg(test)]
 fn document_request(ack: u64, document: &str, query: Value) -> String {
     let payload = json!(["modifyDocument", {"type": document, "action": "get", "operation": {"action":"get", "query": query, "index": false, "broadcast": false}}]);
     format!("42{ack}{payload}")
@@ -193,7 +321,10 @@ fn world_response(frame: &str) -> Result<Value> {
 }
 
 fn world_info(result: &Value) -> WorldInfo {
-    let meta = result.get("meta").unwrap_or(result);
+    let meta = result
+        .get("world")
+        .or_else(|| result.get("meta"))
+        .unwrap_or(result);
     WorldInfo {
         title: meta.get("title").and_then(Value::as_str).map(str::to_owned),
         system: meta
@@ -201,7 +332,8 @@ fn world_info(result: &Value) -> WorldInfo {
             .and_then(Value::as_str)
             .map(str::to_owned),
         version: meta
-            .get("version")
+            .get("coreVersion")
+            .or_else(|| meta.get("version"))
             .and_then(Value::as_str)
             .map(str::to_owned),
     }
@@ -310,7 +442,7 @@ impl FoundryClient {
         &self,
         credential: &FoundryCredential,
         document: &str,
-        query: Value,
+        operation: Value,
     ) -> Result<Value> {
         let (session, generation) = self.session(credential).await?;
         let request = socket_request(&credential.hostname, &session, generation)?;
@@ -349,17 +481,28 @@ impl FoundryClient {
             .map_err(|_| anyhow!("Timed out waiting for Foundry world response"))?;
         }
         let ack = 1;
+        let action = operation
+            .get("action")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("missing document action"))?;
+        let payload =
+            json!(["modifyDocument", {"type": document, "action": action, "operation": operation}]);
         socket
-            .send(Message::Text(document_request(ack, document, query).into()))
+            .send(Message::Text(format!("42{ack}{payload}").into()))
             .await
             .map_err(|_| anyhow!("Failed sending Foundry document request"))?;
         timeout(RESPONSE_TIMEOUT, async {
+            let applied = if action == "get" {
+                String::new()
+            } else {
+                ", and the operation may have been applied".to_string()
+            };
             loop {
                 let frame = socket
                     .next()
                     .await
-                    .ok_or_else(|| anyhow!("Foundry socket closed"))?
-                    .map_err(|_| anyhow!("Foundry socket read failed"))?;
+                    .ok_or_else(|| anyhow!("Foundry socket closed{applied}"))?
+                    .map_err(|_| anyhow!("Foundry socket read failed{applied}"))?;
                 if let Message::Text(text) = frame {
                     if text == "2" {
                         socket
@@ -368,14 +511,31 @@ impl FoundryClient {
                             .map_err(|_| anyhow!("Foundry pong failed"))?;
                         continue;
                     }
-                    if let Some(value) = document_ack(text.as_str(), ack, document)? {
-                        return Ok(value);
+                    if let Some(response) =
+                        document_ack_response(text.as_str(), ack, document, action)?
+                    {
+                        if action != "get" {
+                            let key = match action {
+                                "create" => "data",
+                                "update" => "updates",
+                                "delete" => "ids",
+                                _ => bail!("unsupported document action"),
+                            };
+                            validate_write_ack(&response, action, &operation[key])?;
+                        }
+                        return Ok(response["result"].clone());
                     }
                 }
             }
         })
         .await
-        .map_err(|_| anyhow!("Timed out waiting for Foundry document response"))?
+        .map_err(|_| {
+            if action == "get" {
+                anyhow!("Timed out waiting for Foundry document response")
+            } else {
+                anyhow!("Timed out waiting for Foundry document response, and the operation may have been applied")
+            }
+        })?
     }
 
     pub async fn list_documents(
@@ -399,7 +559,98 @@ impl FoundryClient {
             "settings" => "Setting",
             _ => bail!("unsupported collection"),
         };
-        self.request(credential, kind, json!({})).await
+        self.request(
+            credential,
+            kind,
+            json!({"action":"get", "query":{}, "index":false, "broadcast":false}),
+        )
+        .await
+    }
+
+    pub async fn create_document(
+        &self,
+        cred: &FoundryCredential,
+        kind: &str,
+        data: Vec<Value>,
+        parent_uuid: Option<&str>,
+        pack: Option<&str>,
+    ) -> Result<Value> {
+        if data.is_empty() || data.iter().any(|v| !v.is_object()) {
+            bail!("document data must contain objects");
+        }
+        self.write_documents(cred, kind, "create", json!(data), parent_uuid, pack)
+            .await
+    }
+
+    pub async fn modify_document(
+        &self,
+        cred: &FoundryCredential,
+        kind: &str,
+        id: &str,
+        updates: Vec<Value>,
+        parent_uuid: Option<&str>,
+        pack: Option<&str>,
+    ) -> Result<Value> {
+        if id.trim().is_empty() {
+            bail!("document id is required");
+        }
+        if updates.len() != 1 {
+            bail!("exactly one update is required");
+        }
+        let updates: Vec<Value> = updates
+            .into_iter()
+            .map(|mut update| {
+                let object = update
+                    .as_object_mut()
+                    .ok_or_else(|| anyhow!("document updates must be objects"))?;
+                object.insert("_id".into(), json!(id));
+                Ok(update)
+            })
+            .collect::<Result<_>>()?;
+        self.write_documents(cred, kind, "update", json!(updates), parent_uuid, pack)
+            .await
+    }
+
+    pub async fn delete_document(
+        &self,
+        cred: &FoundryCredential,
+        kind: &str,
+        ids: Vec<String>,
+        parent_uuid: Option<&str>,
+        pack: Option<&str>,
+    ) -> Result<Value> {
+        if ids.is_empty() || ids.iter().any(|id| id.trim().is_empty()) {
+            bail!("document ids are required");
+        }
+        let mut unique = std::collections::HashSet::new();
+        if ids.iter().any(|id| !unique.insert(id)) {
+            bail!("duplicate document ids are not allowed");
+        }
+        self.write_documents(cred, kind, "delete", json!(ids), parent_uuid, pack)
+            .await
+    }
+
+    async fn write_documents(
+        &self,
+        cred: &FoundryCredential,
+        kind: &str,
+        action: &str,
+        values: Value,
+        parent_uuid: Option<&str>,
+        pack: Option<&str>,
+    ) -> Result<Value> {
+        if kind.trim().is_empty() || kind == "World" {
+            bail!("invalid document type");
+        }
+        let options = DocumentOptions {
+            parent_uuid: parent_uuid.map(str::to_owned),
+            pack: pack.map(str::to_owned),
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis() as u64;
+        self.request(cred, kind, write_operation(action, values, &options, now)?)
+            .await
     }
 
     pub async fn world(&self, credential: &FoundryCredential) -> Result<WorldInfo> {
@@ -411,6 +662,172 @@ impl FoundryClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn rejects_multiple_updates_and_duplicate_delete_ids_before_connecting() {
+        let client = FoundryClient::new().unwrap();
+        let credential = FoundryCredential {
+            id: None,
+            hostname: "example.org".into(),
+            userid: None,
+            username: None,
+            password: String::new(),
+        };
+        let error = client
+            .modify_document(
+                &credential,
+                "Actor",
+                "a",
+                vec![json!({}), json!({})],
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exactly one update"), "{error}");
+        let error = client
+            .delete_document(
+                &credential,
+                "Actor",
+                vec!["a".into(), "a".into()],
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("duplicate"), "{error}");
+    }
+
+    #[test]
+    fn type_mismatch_keeps_waiting_and_read_errors_do_not_claim_applied() {
+        assert!(
+            document_ack_response("431[{\"type\":\"Item\",\"result\":[]}]", 1, "Actor", "get")
+                .unwrap()
+                .is_none()
+        );
+        let read_error = document_ack_response(
+            "431[{\"type\":\"Actor\",\"error\":{\"message\":\"denied\"}}]",
+            1,
+            "Actor",
+            "get",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            !read_error.contains("may have been applied"),
+            "{read_error}"
+        );
+        let write_error = document_ack_response(
+            "431[{\"type\":\"Actor\",\"error\":{\"message\":\"denied\"}}]",
+            1,
+            "Actor",
+            "update",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            write_error.contains("may have been applied"),
+            "{write_error}"
+        );
+    }
+
+    #[test]
+    fn exact_match_failures_carry_ambiguity_caveat() {
+        let update = json!({"action":"update","result":[{"_id":"b"}]});
+        let error = validate_write_ack(&update, "update", &json!([{"_id":"a"}]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("may have been applied"), "{error}");
+        let delete = json!({"action":"delete","result":["a","c"]});
+        let error = validate_write_ack(&delete, "delete", &json!(["a", "b"]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("may have been applied"), "{error}");
+        let duplicate = json!({"action":"delete","result":["a","a"]});
+        let error = validate_write_ack(&duplicate, "delete", &json!(["a"]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("may have been applied"), "{error}");
+        let create = json!({"action":"create","result":[{"_id":""}]});
+        let error = validate_write_ack(&create, "create", &json!([{}]))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("may have been applied"), "{error}");
+    }
+
+    #[test]
+    fn write_ack_rejects_extra_malformed_and_duplicate_ids() {
+        for (action, requested, responses) in [
+            (
+                "update",
+                json!([{"_id":"a"}]),
+                vec![
+                    json!([{"_id":"a"},{"_id":"b"}]),
+                    json!([{"_id":"a"},{}]),
+                    json!([{"_id":"a"},{"_id":"a"}]),
+                ],
+            ),
+            (
+                "delete",
+                json!(["a", "b"]),
+                vec![
+                    json!(["a", "b", "c"]),
+                    json!(["a", "b", null]),
+                    json!(["a", "b", "a"]),
+                    json!(["a", "a"]),
+                ],
+            ),
+            (
+                "create",
+                json!([{}, {}]),
+                vec![json!([{"_id":"a"},{"_id":"a"}])],
+            ),
+        ] {
+            for result in responses {
+                assert!(
+                    validate_write_ack(
+                        &json!({"action":action,"result":result}),
+                        action,
+                        &requested
+                    )
+                    .is_err(),
+                    "{action} {result}"
+                );
+            }
+        }
+        assert!(validate_write_ack(
+            &json!({"action":"delete","result":["b","a"]}),
+            "delete",
+            &json!(["a", "b"])
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn create_ack_requires_nonempty_ids_and_exact_count() {
+        let requested = json!([{}]);
+        for result in [
+            json!([{}]),
+            json!([{"_id":""}]),
+            json!([{"_id":"  "}]),
+            json!([{"_id":1}]),
+            json!([]),
+            json!([{"_id":"a"},{"_id":"b"}]),
+        ] {
+            assert!(validate_write_ack(
+                &json!({"action":"create","result":result}),
+                "create",
+                &requested
+            )
+            .is_err());
+        }
+        assert!(validate_write_ack(
+            &json!({"action":"create","result":[{"_id":"a"}]}),
+            "create",
+            &requested
+        )
+        .is_ok());
+    }
+
     #[test]
     fn rejects_path_in_hostname() {
         assert!(FoundryClient::host_url("example.com/world", "/join").is_err());
@@ -487,6 +904,96 @@ mod tests {
     }
 
     #[test]
+    fn builds_write_operations_with_reference_protocol_fields() {
+        let options = DocumentOptions {
+            parent_uuid: Some("Actor.a".into()),
+            pack: Some("world.items".into()),
+        };
+        let create = write_operation("create", json!([{"name":"Sword"}]), &options, 123).unwrap();
+        assert_eq!(
+            create,
+            json!({"action":"create","pack":"world.items","parentUuid":"Actor.a","data":[{"name":"Sword"}],"modifiedTime":123,"renderSheet":true,"render":true})
+        );
+        let update = write_operation(
+            "update",
+            json!([{"_id":"i","name":"A"}]),
+            &DocumentOptions::default(),
+            123,
+        )
+        .unwrap();
+        assert_eq!(
+            update,
+            json!({"action":"update","pack":null,"updates":[{"_id":"i","name":"A"}],"modifiedTime":123,"diff":false,"recursive":true,"render":true})
+        );
+        let delete =
+            write_operation("delete", json!(["i"]), &DocumentOptions::default(), 123).unwrap();
+        assert_eq!(
+            delete,
+            json!({"action":"delete","pack":null,"ids":["i"],"modifiedTime":123,"deleteAll":false,"render":true})
+        );
+    }
+
+    #[test]
+    fn write_ack_reports_errors_without_type_and_rejects_invalid_result() {
+        assert!(document_ack("431[{\"error\":{\"message\":\"denied\"}}]", 1, "Actor").is_err());
+        assert!(document_ack("431[{\"type\":\"Actor\",\"result\":null}]", 1, "Actor").is_err());
+    }
+
+    #[test]
+    fn write_ack_requires_action_and_complete_results() {
+        let update = json!([{"_id":"a"}, {"_id":"b"}]);
+        assert!(validate_write_ack(
+            &json!({"action":"delete","result":[{"_id":"a"},{"_id":"b"}]}),
+            "update",
+            &update
+        )
+        .is_err());
+        assert!(validate_write_ack(
+            &json!({"action":"update","result":[{"_id":"a"}]}),
+            "update",
+            &update
+        )
+        .is_err());
+        assert!(validate_write_ack(
+            &json!({"action":"delete","result":["a"]}),
+            "delete",
+            &json!(["a", "b"])
+        )
+        .is_err());
+        assert!(validate_write_ack(
+            &json!({"action":"create","result":[]}),
+            "create",
+            &json!([{}])
+        )
+        .is_err());
+        assert!(validate_write_ack(
+            &json!({"action":"create","result":[{"_id":"a"}]}),
+            "create",
+            &json!([{}])
+        )
+        .is_ok());
+        assert!(validate_write_ack(
+            &json!({"action":"delete","result":["a","b"]}),
+            "delete",
+            &json!(["a", "b"])
+        )
+        .is_ok());
+        assert!(validate_write_ack(
+            &json!({"action":"update","result":[{"_id":"a"},{"_id":"b"}]}),
+            "update",
+            &update
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn preserves_foundry_decimal_in_document_ack() {
+        let frame = r#"431[{"type":"Actor","result":[{"scaleX":0.9615384615384615}]}]"#;
+        let result = document_ack(frame, 1, "Actor").unwrap().unwrap();
+        assert_eq!(result.to_string(), r#"[{"scaleX":0.9615384615384615}]"#);
+    }
+
+    #[test]
     fn parses_ack_only_for_matching_id_and_extracts_result() {
         assert_eq!(
             document_ack(
@@ -507,6 +1014,18 @@ mod tests {
             "Actor"
         )
         .is_err());
+    }
+
+    #[test]
+    fn extracts_live_v14_world_metadata() {
+        let info = world_info(&json!({
+            "world": {"title": "My World", "system": "mta", "coreVersion": "14.370"},
+            "system": {"id": "mta", "version": "0.19.2"},
+            "release": {"generation": 14, "build": 370}
+        }));
+        assert_eq!(info.title.as_deref(), Some("My World"));
+        assert_eq!(info.system.as_deref(), Some("mta"));
+        assert_eq!(info.version.as_deref(), Some("14.370"));
     }
 
     #[test]
