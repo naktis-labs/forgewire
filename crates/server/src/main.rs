@@ -1,5 +1,5 @@
 use axum::{
-    extract::{DefaultBodyLimit, Path, Request, State},
+    extract::{DefaultBodyLimit, Path, Query, Request, State},
     http::{header, HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -8,189 +8,246 @@ use axum::{
 };
 use foundry_connector::{FoundryClient, FoundryCredential};
 use serde_json::{json, Value};
-use std::{env, net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, env, net::SocketAddr, sync::Arc};
 
 mod compendium_tools;
 mod file_tools;
 mod instances;
+mod operations;
 mod read_tools;
+
+#[cfg(test)]
+mod contract_tests;
 
 #[derive(Clone)]
 struct App {
-    client: FoundryClient,
+    client: Arc<dyn operations::Connector>,
     instances: instances::Instances,
+    selections: instances::Selections,
     allow_writes: bool,
+}
+
+/// Resolve a REST request's Foundry target: `?instance=<id|item_order>` when
+/// given, else the documented stable default — the first configured entry.
+/// The result is an owned credential snapshot taken once per request, so
+/// neither MCP selections nor other REST requests can retarget work already
+/// in flight; there is no process-global selection to inherit or mutate.
+fn rest_target(
+    instances: &instances::Instances,
+    query: &HashMap<String, String>,
+) -> Result<FoundryCredential, (StatusCode, Json<Value>)> {
+    match query.get("instance") {
+        Some(reference) => instances
+            .resolve_reference(reference)
+            .and_then(|index| instances.credential(index))
+            .map_err(|e| rest_error(StatusCode::BAD_REQUEST, e)),
+        None => Ok(instances.default_snapshot()),
+    }
 }
 
 async fn health() -> Json<Value> {
     Json(json!({"status":"ok"}))
 }
-async fn world(State(app): State<Arc<App>>) -> Result<Json<Value>, (StatusCode, String)> {
-    let credential = app.instances.snapshot();
-    app.client
-        .world(&credential)
+async fn world(
+    State(app): State<Arc<App>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let credential = rest_target(&app.instances, &query)?;
+    operations::world(&*app.client, &credential)
         .await
-        .map(|v| Json(serde_json::to_value(v).unwrap_or(Value::Null)))
-        .map_err(internal)
+        .map(Json)
+        .map_err(operation_status)
 }
 async fn collection(
     State(app): State<Arc<App>>,
     Path(name): Path<String>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    let credential = app.instances.snapshot();
-    app.client
-        .list_documents(&credential, &name)
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let credential = rest_target(&app.instances, &query)?;
+    operations::collection(&*app.client, &credential, &name)
         .await
         .map(Json)
-        .map_err(internal)
-}
-fn internal(e: anyhow::Error) -> (StatusCode, String) {
-    (StatusCode::BAD_GATEWAY, e.to_string())
+        .map_err(operation_status)
 }
 
-type WriteArguments<'a> = (
-    &'a str,
-    Option<&'a str>,
-    Option<&'a str>,
-    Option<&'a str>,
-    Vec<Value>,
-    Vec<String>,
-);
+fn rest_error(status: StatusCode, error: impl ToString) -> (StatusCode, Json<Value>) {
+    (status, Json(json!({"error":error.to_string()})))
+}
 
-/// Document kinds accepted for write operations: the primary document types
-/// plus the embedded document kinds from the upstream server-tools type list
-/// (which require `parent_uuid` to address their parent document).
-const WRITE_KINDS: [&str; 23] = [
-    "Actor",
-    "Item",
-    "Folder",
-    "User",
-    "Scene",
-    "JournalEntry",
-    "Macro",
-    "Cards",
-    "Playlist",
-    "RollTable",
-    "Combat",
-    "ChatMessage",
-    "Setting",
-    "Combatant",
-    "ActiveEffect",
-    "Drawing",
-    "MeasuredTemplate",
-    "Note",
-    "Tile",
-    "Token",
-    "Wall",
-    "AmbientLight",
-    "AmbientSound",
-];
-
-fn write_arguments<'a>(args: &'a Value, operation: &str) -> anyhow::Result<WriteArguments<'a>> {
-    let kind = args
-        .get("kind")
-        .and_then(Value::as_str)
-        .filter(|s| WRITE_KINDS.contains(s))
-        .ok_or_else(|| anyhow::anyhow!("invalid kind"))?;
-    let optional = |key| -> anyhow::Result<Option<&str>> {
-        match args.get(key) {
-            None | Some(Value::Null) => Ok(None),
-            Some(Value::String(s)) if !s.trim().is_empty() => Ok(Some(s)),
-            _ => Err(anyhow::anyhow!("invalid {key}")),
-        }
+/// Map the shared typed operation error to REST status codes: caller mistakes
+/// are 400/404, policy gates are 403, and only Foundry contact or response
+/// failures are 502.
+fn operation_status(error: operations::OperationError) -> (StatusCode, Json<Value>) {
+    let status = match &error {
+        operations::OperationError::Invalid(_) => StatusCode::BAD_REQUEST,
+        operations::OperationError::NotFound(_) => StatusCode::NOT_FOUND,
+        operations::OperationError::Forbidden(_) => StatusCode::FORBIDDEN,
+        operations::OperationError::Upstream(_) => StatusCode::BAD_GATEWAY,
     };
-    if operation == "create_document" && args.get("id").is_some() {
-        anyhow::bail!("id must not be supplied to create_document");
-    }
-    let id = optional("id")?;
-    let parent = optional("parent_uuid")?;
-    let pack = optional("pack")?;
-    let mut data = Vec::new();
-    let mut ids = Vec::new();
-    if operation == "delete_document" {
-        let values = args
-            .get("ids")
-            .and_then(Value::as_array)
-            .filter(|a| !a.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("ids must be a non-empty array"))?;
-        for value in values {
-            ids.push(
-                value
-                    .as_str()
-                    .filter(|s| !s.trim().is_empty())
-                    .ok_or_else(|| anyhow::anyhow!("invalid id"))?
-                    .to_owned(),
-            );
-        }
-    } else {
-        let field = if operation == "create_document" {
-            "data"
-        } else {
-            "updates"
-        };
-        data = args
-            .get(field)
-            .and_then(Value::as_array)
-            .filter(|a| !a.is_empty() && a.iter().all(Value::is_object))
-            .ok_or_else(|| anyhow::anyhow!("{field} must be a non-empty array of objects"))?
-            .clone();
-        if operation == "modify_document" && id.is_none() {
-            anyhow::bail!("id is required");
-        }
-    }
-    Ok((kind, id, parent, pack, data, ids))
+    rest_error(status, error)
 }
 
-async fn write_document(
-    app: &App,
-    credential: &FoundryCredential,
-    operation: &str,
-    args: &Value,
-) -> anyhow::Result<Value> {
-    if !app.allow_writes {
-        anyhow::bail!("writes are disabled; set FOUNDRY_ALLOW_WRITES=true to enable");
+async fn rest_documents(
+    State(app): State<Arc<App>>,
+    Path(collection): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let args =
+        operations::rest_read_args(&query).map_err(|e| rest_error(StatusCode::BAD_REQUEST, e))?;
+    let (name, args) = operations::parse_rest_read(&collection, &args)
+        .map_err(|e| rest_error(StatusCode::BAD_REQUEST, e))?;
+    let req =
+        operations::parse_read(&name, &args).map_err(|e| rest_error(StatusCode::BAD_REQUEST, e))?;
+    let credential = rest_target(&app.instances, &query)?;
+    operations::execute_read(&*app.client, &credential, &req)
+        .await
+        .map(Json)
+        .map_err(operation_status)
+}
+
+async fn rest_compendiums(
+    State(app): State<Arc<App>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let args = query
+        .get("type")
+        .map(|value| json!({"type":value}))
+        .unwrap_or_else(|| json!({}));
+    let credential = rest_target(&app.instances, &query)?;
+    operations::read(&*app.client, &credential, "get_compendiums", &args)
+        .await
+        .map(Json)
+        .map_err(operation_status)
+}
+
+async fn rest_compendium_documents(
+    State(app): State<Arc<App>>,
+    Path((pack, kind)): Path<(String, String)>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let args =
+        operations::rest_read_args(&query).map_err(|e| rest_error(StatusCode::BAD_REQUEST, e))?;
+    let (name, args) = operations::parse_rest_pack_read(&kind, &pack, &args)
+        .map_err(|e| rest_error(StatusCode::BAD_REQUEST, e))?;
+    let req =
+        operations::parse_read(&name, &args).map_err(|e| rest_error(StatusCode::BAD_REQUEST, e))?;
+    let credential = rest_target(&app.instances, &query)?;
+    operations::execute_read(&*app.client, &credential, &req)
+        .await
+        .map(Json)
+        .map_err(operation_status)
+}
+
+async fn rest_create_compendium(
+    State(app): State<Arc<App>>,
+    Query(query): Query<HashMap<String, String>>,
+    Json(args): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let credential = rest_target(&app.instances, &query)?;
+    operations::compendium(
+        &*app.client,
+        &credential,
+        app.allow_writes,
+        "create_compendium",
+        &args,
+    )
+    .await
+    .map(Json)
+    .map_err(operation_status)
+}
+
+async fn rest_delete_compendium(
+    State(app): State<Arc<App>>,
+    Path(name): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let credential = rest_target(&app.instances, &query)?;
+    operations::compendium(
+        &*app.client,
+        &credential,
+        app.allow_writes,
+        "delete_compendium",
+        &json!({"name":name}),
+    )
+    .await
+    .map(Json)
+    .map_err(operation_status)
+}
+
+async fn rest_instances(
+    State(app): State<Arc<App>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // Listing flags which entry the requested reference (or the stable
+    // default) would target; it never exposes secrets or connection state.
+    let selected = match query.get("instance") {
+        Some(reference) => app
+            .instances
+            .resolve_reference(reference)
+            .map_err(|e| rest_error(StatusCode::BAD_REQUEST, e))?,
+        None => 0,
+    };
+    Ok(Json(app.instances.show(selected)))
+}
+
+async fn rest_browse_files(
+    State(app): State<Arc<App>>,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let mut args = json!({});
+    for key in ["target", "type", "kind"] {
+        if let Some(value) = query.get(key) {
+            args[key] = json!(value);
+        }
     }
-    let (kind, id, parent, pack, data, ids) = write_arguments(args, operation)?;
-    match operation {
-        "create_document" => {
-            app.client
-                .create_document(credential, kind, data, parent, pack)
-                .await
-        }
-        "modify_document" => {
-            app.client
-                .modify_document(credential, kind, id.unwrap(), data, parent, pack)
-                .await
-        }
-        "delete_document" => {
-            app.client
-                .delete_document(credential, kind, ids, parent, pack)
-                .await
-        }
-        _ => Err(anyhow::anyhow!("unknown operation")),
+    if let Some(extensions) = query.get("extensions") {
+        args["extensions"] = json!(extensions
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>());
     }
+    let credential = rest_target(&app.instances, &query)?;
+    operations::browse_files(&*app.client, &credential, &args)
+        .await
+        .map(Json)
+        .map_err(operation_status)
+}
+
+async fn rest_upload_file(
+    State(app): State<Arc<App>>,
+    Query(query): Query<HashMap<String, String>>,
+    Json(args): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let credential = rest_target(&app.instances, &query)?;
+    operations::upload_file(&*app.client, &credential, app.allow_writes, &args)
+        .await
+        .map(Json)
+        .map_err(operation_status)
 }
 
 async fn rest_write(
     State(app): State<Arc<App>>,
     Path(operation): Path<String>,
+    Query(query): Query<HashMap<String, String>>,
     Json(args): Json<Value>,
-) -> Result<Json<Value>, (StatusCode, String)> {
-    if !app.allow_writes {
-        return Err((StatusCode::FORBIDDEN, "writes are disabled".into()));
-    }
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     if !matches!(
         operation.as_str(),
         "create_document" | "modify_document" | "delete_document"
     ) {
-        return Err((StatusCode::NOT_FOUND, "unknown operation".into()));
+        return Err(rest_error(StatusCode::NOT_FOUND, "unknown operation"));
     }
-    write_arguments(&args, &operation).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let credential = app.instances.snapshot();
-    write_document(&app, &credential, &operation, &args)
-        .await
-        .map(Json)
-        .map_err(internal)
+    let credential = rest_target(&app.instances, &query)?;
+    operations::write_document(
+        &*app.client,
+        &credential,
+        app.allow_writes,
+        &operation,
+        &args,
+    )
+    .await
+    .map(Json)
+    .map_err(operation_status)
 }
 
 async fn reject_origin(request: Request, next: Next) -> Response {
@@ -220,6 +277,21 @@ fn router(app: Arc<App>) -> Router {
         .route("/health", get(health))
         .route("/api/world", get(world))
         .route("/api/collections/{name}", get(collection))
+        .route("/api/documents/{collection}", get(rest_documents))
+        .route(
+            "/api/compendiums",
+            get(rest_compendiums).post(rest_create_compendium),
+        )
+        .route(
+            "/api/compendiums/{name}",
+            axum::routing::delete(rest_delete_compendium),
+        )
+        .route(
+            "/api/compendiums/{pack}/documents/{kind}",
+            get(rest_compendium_documents),
+        )
+        .route("/api/instances", get(rest_instances))
+        .route("/api/files", get(rest_browse_files).post(rest_upload_file))
         .route("/api/write/{operation}", post(rest_write))
         .route("/mcp", post(mcp))
         .with_state(app)
@@ -263,9 +335,53 @@ async fn mcp(
         return (StatusCode::BAD_REQUEST, Json(json!({"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"invalid request"}}))).into_response();
     }
     let method = input["method"].as_str().unwrap();
+    // MCP sessions scope instance selection per client: `initialize` issues
+    // the id (returned as `Mcp-Session-Id`), later requests echo it, and an
+    // unknown or expired id is refused so the client reinitializes instead of
+    // silently landing in another client's scope. Liveness and targeting are
+    // resolved by one atomic lookup, so a session that expires mid-request
+    // fails with the initialize-again error instead of silently running
+    // ordinary tool calls against the stable default. Requests without a
+    // header are anonymous: tools run against the stable default instance and
+    // `choose_foundry_instance` has no scope to record a selection in.
+    let mut session_headers = headers.get_all("mcp-session-id").iter();
+    let session = match session_headers.next() {
+        None => None,
+        Some(value) => {
+            let id = value
+                .to_str()
+                .ok()
+                .filter(|id| !id.is_empty())
+                .map(str::to_owned);
+            if id.is_none() || session_headers.next().is_some() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error":"invalid MCP session header"})),
+                )
+                    .into_response();
+            }
+            id
+        }
+    };
+    let mut scope = instances::SessionScope::Default;
+    if let Some(id) = &session {
+        if method != "initialize" {
+            match app.selections.scope(id) {
+                instances::SessionScope::Expired => {
+                    return (
+                        StatusCode::NOT_FOUND,
+                        Json(json!({"error":"unknown or expired MCP session; initialize again"})),
+                    )
+                        .into_response();
+                }
+                resolved => scope = resolved,
+            }
+        }
+    }
     let Some(id) = input.get("id").cloned() else {
         return StatusCode::ACCEPTED.into_response();
     };
+    let mut issued_session = None;
     let response = match method {
         "initialize" => {
             let requested = input
@@ -278,6 +394,7 @@ async fn mcp(
                 None => "2025-03-26",
                 Some(_) => "2025-06-18",
             };
+            issued_session = Some(app.selections.issue());
             json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":version,"capabilities":{"tools":{}},"serverInfo":{"name":"forgewire","version":"0.1.0"}}})
         }
         "ping" => json!({"jsonrpc":"2.0","id":id,"result":{}}),
@@ -288,7 +405,7 @@ async fn mcp(
             ];
             tools.extend([
                 json!({"name":"show_credentials","description":"List configured Foundry instances without passwords","inputSchema":{"type":"object","properties":{}}}),
-                json!({"name":"choose_foundry_instance","description":"Select an instance without verifying its connection","inputSchema":{"type":"object","properties":{"_id":{"type":"string"},"id":{"type":"string"},"item_order":{"type":"integer","minimum":0}}}}),
+                json!({"name":"choose_foundry_instance","description":"Select the instance for this MCP session (issued at initialize) without verifying its connection","inputSchema":{"type":"object","properties":{"_id":{"type":"string"},"id":{"type":"string"},"item_order":{"type":"integer","minimum":0}}}}),
             ]);
             tools.extend(read_tools::definitions());
             tools.extend(file_tools::definitions());
@@ -302,7 +419,10 @@ async fn mcp(
                 if name == "modify_document" {
                     required.push("id");
                 }
-                let kinds: Vec<Value> = WRITE_KINDS.iter().map(|kind| json!(kind)).collect();
+                let kinds: Vec<Value> = operations::WRITE_KINDS
+                    .iter()
+                    .map(|kind| json!(kind))
+                    .collect();
                 tools.push(json!({"name":name,"description":"Write Foundry documents (requires FOUNDRY_ALLOW_WRITES=true); embedded kinds such as Token or Wall require parent_uuid","inputSchema":{"type":"object","properties":{"kind":{"type":"string","enum":kinds},"id":{"type":"string","minLength":1},"parent_uuid":{"type":"string","minLength":1},"pack":{"type":"string","minLength":1},(field):{"type":"array","minItems":1,"items":{"type":if field == "ids" { "string" } else { "object" }}}},"required":required}}));
             }
             json!({"jsonrpc":"2.0","id":id,"result":{"tools":tools}})
@@ -311,37 +431,45 @@ async fn mcp(
             let params = input.get("params").unwrap_or(&Value::Null);
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let args = params.get("arguments").unwrap_or(&Value::Null);
-            let credential = app.instances.snapshot();
+            // The target is the scope resolved atomically with the session
+            // check above: the session's own selection, or the stable default
+            // when it has not chosen (or the caller is anonymous). The
+            // snapshot is owned, so in-flight work cannot be retargeted.
+            let selected = match scope {
+                instances::SessionScope::Selected(index) => Some(index),
+                instances::SessionScope::Default | instances::SessionScope::Expired => None,
+            };
             let result = match name {
-                "show_credentials" => Ok(app.instances.show()),
-                "choose_foundry_instance" => app.instances.select(args),
-                "get_world" => app
-                    .client
-                    .world(&credential)
-                    .await
-                    .map(|v| serde_json::to_value(v).unwrap_or(Value::Null)),
-                "list_documents" => {
-                    app.client
-                        .list_documents(
-                            &credential,
-                            args.get("collection").and_then(Value::as_str).unwrap_or(""),
-                        )
-                        .await
+                "show_credentials" => Ok(app.instances.show(selected.unwrap_or(0))),
+                "choose_foundry_instance" => match &session {
+                    Some(id) => app.instances.resolve_selection(args).and_then(|index| {
+                        // `select` re-checks liveness under the lock that
+                        // records the choice: a session evicted after this
+                        // request's own session check (a concurrent
+                        // initialize filling the table) must surface as an
+                        // error instead of a phantom `selected: true`.
+                        if app.selections.select(id, index) {
+                            Ok(instances::selection_report(index))
+                        } else {
+                            Err(anyhow::anyhow!(
+                                "unknown or expired MCP session; initialize again"
+                            ))
+                        }
+                    }),
+                    None => Err(anyhow::anyhow!(
+                        "choose_foundry_instance requires an MCP session: initialize first and send the returned Mcp-Session-Id header"
+                    )),
+                },
+                _ => {
+                    let credential = match selected {
+                        Some(index) => app.instances.credential(index),
+                        None => Ok(app.instances.default_snapshot()),
+                    };
+                    match credential {
+                        Ok(credential) => dispatch_tool(&app, &credential, name, args).await,
+                        Err(err) => Err(err),
+                    }
                 }
-                "create_document" | "modify_document" | "delete_document" => {
-                    write_document(&app, &credential, name, args).await
-                }
-                _ if file_tools::recognizes(name) => {
-                    file_tools::call(&app.client, &credential, app.allow_writes, name, args).await
-                }
-                _ if compendium_tools::recognizes(name) => {
-                    compendium_tools::call(&app.client, &credential, app.allow_writes, name, args)
-                        .await
-                }
-                _ if read_tools::recognizes(name) => {
-                    read_tools::call(&app.client, &credential, name, args).await
-                }
-                _ => Err(anyhow::anyhow!("unknown tool")),
             };
             match result {
                 Ok(value) => tool_success(id, value),
@@ -353,10 +481,54 @@ async fn mcp(
         _ => json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"method not found"}}),
     };
     let mut response = Json(response).into_response();
+    if let Some(session_id) = issued_session {
+        if let Ok(value) = header::HeaderValue::from_str(&session_id) {
+            response
+                .headers_mut()
+                .insert(header::HeaderName::from_static("mcp-session-id"), value);
+        }
+    }
     response
         .headers_mut()
         .insert(header::CONTENT_TYPE, "application/json".parse().unwrap());
     response
+}
+
+/// Route a non-selection MCP tool to the shared application operations using
+/// the caller's own target snapshot.
+async fn dispatch_tool(
+    app: &App,
+    credential: &FoundryCredential,
+    name: &str,
+    args: &Value,
+) -> anyhow::Result<Value> {
+    match name {
+        "get_world" => operations::world(&*app.client, credential)
+            .await
+            .map_err(anyhow::Error::from),
+        "list_documents" => operations::collection(
+            &*app.client,
+            credential,
+            args.get("collection").and_then(Value::as_str).unwrap_or(""),
+        )
+        .await
+        .map_err(anyhow::Error::from),
+        "create_document" | "modify_document" | "delete_document" => {
+            operations::write_document(&*app.client, credential, app.allow_writes, name, args)
+                .await
+                .map_err(anyhow::Error::from)
+        }
+        _ if file_tools::recognizes(name) => {
+            file_tools::call(&*app.client, credential, app.allow_writes, name, args).await
+        }
+        _ if compendium_tools::recognizes(name) => {
+            compendium_tools::call(&*app.client, credential, app.allow_writes, name, args).await
+        }
+        _ if read_tools::recognizes(name) => {
+            read_tools::call(&*app.client, credential, name, args).await
+        }
+        _ => Err(anyhow::anyhow!("unknown tool")),
+    }
 }
 
 fn validate_bind_addr(addr: SocketAddr) -> anyhow::Result<()> {
@@ -388,8 +560,9 @@ async fn main() -> anyhow::Result<()> {
     }
     let credentials: Vec<FoundryCredential> = serde_json::from_value(Value::Array(entries))?;
     let app = Arc::new(App {
-        client: FoundryClient::new()?,
+        client: Arc::new(FoundryClient::new()?),
         instances: instances::Instances::new(credentials)?,
+        selections: instances::Selections::new(),
         allow_writes: env::var("FOUNDRY_ALLOW_WRITES").as_deref() == Ok("true"),
     });
     let router = router(app);
@@ -414,7 +587,7 @@ mod tests {
 
     fn app() -> Router {
         router(Arc::new(App {
-            client: FoundryClient::new().unwrap(),
+            client: Arc::new(FoundryClient::new().unwrap()),
             allow_writes: false,
             instances: instances::Instances::new(vec![FoundryCredential {
                 id: None,
@@ -424,6 +597,7 @@ mod tests {
                 password: String::new(),
             }])
             .unwrap(),
+            selections: instances::Selections::new(),
         }))
     }
 
@@ -517,6 +691,35 @@ mod tests {
     }
 
     #[test]
+    fn operation_errors_map_to_rest_statuses_with_the_json_envelope() {
+        for (error, expected) in [
+            (
+                operations::OperationError::Invalid(anyhow::anyhow!("bad input")),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                operations::OperationError::NotFound(anyhow::anyhow!("missing")),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                operations::OperationError::Forbidden(anyhow::anyhow!("disabled")),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                operations::OperationError::Upstream(anyhow::anyhow!("socket failed")),
+                StatusCode::BAD_GATEWAY,
+            ),
+        ] {
+            let (status, body) = operation_status(error);
+            assert_eq!(status, expected);
+            assert!(
+                body.0.get("error").is_some(),
+                "{status} must carry the error envelope"
+            );
+        }
+    }
+
+    #[test]
     fn rejects_invalid_write_arguments() {
         for args in [
             json!({}),
@@ -525,23 +728,33 @@ mod tests {
             json!({"kind":"Unknown","data":[{}]}),
             json!({"kind":"Actor","data":[{}],"pack":""}),
         ] {
-            assert!(write_arguments(&args, "create_document").is_err());
+            assert!(operations::write_arguments(&args, "create_document").is_err());
         }
-        assert!(
-            write_arguments(&json!({"kind":"Actor","updates":[{}]}), "modify_document").is_err()
-        );
-        assert!(write_arguments(&json!({"kind":"Actor","ids":[""]}), "delete_document").is_err());
-        assert!(write_arguments(&json!({"kind":"Actor","data":[{}]}), "create_document").is_ok());
+        assert!(operations::write_arguments(
+            &json!({"kind":"Actor","updates":[{}]}),
+            "modify_document"
+        )
+        .is_err());
+        assert!(operations::write_arguments(
+            &json!({"kind":"Actor","ids":[""]}),
+            "delete_document"
+        )
+        .is_err());
+        assert!(operations::write_arguments(
+            &json!({"kind":"Actor","data":[{}]}),
+            "create_document"
+        )
+        .is_ok());
     }
 
     #[test]
     fn create_document_rejects_supplied_id_and_accepts_embedded_kinds() {
-        assert!(write_arguments(
+        assert!(operations::write_arguments(
             &json!({"kind":"Actor","data":[{}],"id":"abc"}),
             "create_document"
         )
         .is_err());
-        assert!(write_arguments(
+        assert!(operations::write_arguments(
             &json!({"kind":"Actor","updates":[{}],"id":"abc"}),
             "modify_document"
         )
@@ -559,7 +772,7 @@ mod tests {
             "AmbientSound",
         ] {
             assert!(
-                write_arguments(
+                operations::write_arguments(
                     &json!({"kind":kind,"data":[{}],"parent_uuid":"Scene.abc"}),
                     "create_document"
                 )
@@ -591,9 +804,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rest_document_reads_share_mcp_validation() {
+        let request = Request::get("/api/documents/actors?max_length=-1")
+            .header("host", "localhost")
+            .body(Body::empty())
+            .unwrap();
+        let response = app().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let rest_error: Value = serde_json::from_slice(&body).unwrap();
+
+        let (_, mcp_response) = post(
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_actors","arguments":{"max_length":-1}}}),
+            None,
+        )
+        .await;
+        assert_eq!(mcp_response["result"]["isError"], true);
+        assert_eq!(
+            rest_error["error"],
+            mcp_response["result"]["content"][0]["text"]
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_exposes_compendium_instance_and_file_routes_with_write_gates() {
+        let request = Request::get("/api/instances")
+            .header("host", "localhost")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app().oneshot(request).await.unwrap().status(),
+            StatusCode::OK
+        );
+
+        for (method, path, body) in [
+            (
+                "POST",
+                "/api/compendiums",
+                r#"{"label":"Pack","type":"Actor"}"#,
+            ),
+            (
+                "POST",
+                "/api/files",
+                r#"{"target":"","filename":"x","data_base64":"","overwrite":true}"#,
+            ),
+        ] {
+            let request = Request::builder()
+                .method(method)
+                .uri(path)
+                .header("host", "localhost")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            assert_eq!(
+                app().oneshot(request).await.unwrap().status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn enabled_writes_reject_invalid_input_before_connecting() {
         let mut state = App {
-            client: FoundryClient::new().unwrap(),
+            client: Arc::new(FoundryClient::new().unwrap()),
             instances: instances::Instances::new(vec![FoundryCredential {
                 id: None,
                 hostname: "localhost".into(),
@@ -602,6 +875,7 @@ mod tests {
                 password: String::new(),
             }])
             .unwrap(),
+            selections: instances::Selections::new(),
             allow_writes: true,
         };
         for name in ["create_document", "modify_document", "delete_document"] {
@@ -610,21 +884,33 @@ mod tests {
                 .header("content-type", "application/json")
                 .body(Body::from("{}"))
                 .unwrap();
-            assert_eq!(
-                router(Arc::new(state.clone()))
-                    .oneshot(request)
-                    .await
-                    .unwrap()
-                    .status(),
-                StatusCode::BAD_REQUEST
-            );
-            assert!(
-                write_document(&state, &state.instances.snapshot(), name, &json!({}))
-                    .await
-                    .unwrap_err()
-                    .to_string()
-                    .contains("invalid kind")
-            );
+            let rest_response = router(Arc::new(state.clone()))
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(rest_response.status(), StatusCode::BAD_REQUEST);
+            let rest_body = to_bytes(rest_response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let rest_error = String::from_utf8(rest_body.to_vec()).unwrap();
+            let request = Request::post("/mcp")
+                .header("host", "localhost")
+                .header("content-type", "application/json")
+                .body(Body::from(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":{}}}).to_string()))
+                .unwrap();
+            let response = router(Arc::new(state.clone()))
+                .oneshot(request)
+                .await
+                .unwrap();
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let response: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(response["result"]["isError"], true);
+            let mcp_error = response["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            assert!(rest_error.contains("invalid kind"));
+            assert_eq!(mcp_error, "invalid kind");
         }
         let request = Request::post("/api/write/not_an_operation")
             .header("host", "localhost")
@@ -640,9 +926,10 @@ mod tests {
             StatusCode::NOT_FOUND
         );
         state.allow_writes = false;
-        assert!(write_document(
-            &state,
-            &state.instances.snapshot(),
+        assert!(operations::write_document(
+            &*state.client,
+            &state.instances.default_snapshot(),
+            state.allow_writes,
             "create_document",
             &json!({})
         )
@@ -684,69 +971,157 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mcp_instance_selection_changes_the_active_credential_without_leaking_passwords() {
-        let instances = instances::Instances::new(vec![
-            FoundryCredential {
-                id: Some("one".into()),
-                hostname: "one.example".into(),
-                userid: Some("user-one".into()),
-                username: None,
-                password: "secret-one".into(),
-            },
-            FoundryCredential {
-                id: Some("two".into()),
-                hostname: "two.example".into(),
-                userid: Some("user-two".into()),
-                username: None,
-                password: "secret-two".into(),
-            },
-        ])
-        .unwrap();
+    async fn mcp_instance_selection_is_scoped_to_its_session_without_leaking_passwords() {
         let app = router(Arc::new(App {
-            client: FoundryClient::new().unwrap(),
-            instances: instances.clone(),
+            client: Arc::new(FoundryClient::new().unwrap()),
+            instances: instances::Instances::new(vec![
+                FoundryCredential {
+                    id: Some("one".into()),
+                    hostname: "one.example".into(),
+                    userid: Some("user-one".into()),
+                    username: Some("login-one".into()),
+                    password: "secret-one".into(),
+                },
+                FoundryCredential {
+                    id: Some("two".into()),
+                    hostname: "two.example".into(),
+                    userid: Some("user-two".into()),
+                    username: Some("login-two".into()),
+                    password: "secret-two".into(),
+                },
+            ])
+            .unwrap(),
+            selections: instances::Selections::new(),
             allow_writes: false,
         }));
-        let call = |name: &'static str, arguments: Value| {
+        let send = |session: Option<&str>, body: Value| {
             let app = app.clone();
+            let session = session.map(str::to_owned);
             async move {
-                let request = Request::post("/mcp")
+                let mut request = Request::post("/mcp")
                     .header("host", "localhost")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":arguments}}).to_string(),
-                    ))
+                    .header("content-type", "application/json");
+                if let Some(id) = session.as_deref() {
+                    request = request.header("mcp-session-id", id);
+                }
+                let response = app
+                    .oneshot(request.body(Body::from(body.to_string())).unwrap())
+                    .await
                     .unwrap();
-                let response = app.oneshot(request).await.unwrap();
-                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-                serde_json::from_slice::<Value>(&body).unwrap()
+                let issued = response
+                    .headers()
+                    .get("mcp-session-id")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                let status = response.status();
+                let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                (
+                    status,
+                    serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
+                    issued,
+                )
+            }
+        };
+        let call = |session: Option<&str>, name: &'static str, arguments: Value| {
+            let app = app.clone();
+            let session = session.map(str::to_owned);
+            async move {
+                let mut request = Request::post("/mcp")
+                    .header("host", "localhost")
+                    .header("content-type", "application/json");
+                if let Some(id) = session.as_deref() {
+                    request = request.header("mcp-session-id", id);
+                }
+                let body = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":arguments}});
+                let response = app
+                    .oneshot(request.body(Body::from(body.to_string())).unwrap())
+                    .await
+                    .unwrap();
+                let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null)
             }
         };
 
-        let shown = call("show_credentials", json!({})).await;
+        let initialize = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}});
+        let session_a = send(None, initialize.clone())
+            .await
+            .2
+            .expect("initialize must issue a session id");
+        let session_b = send(None, initialize.clone())
+            .await
+            .2
+            .expect("initialize must issue a session id");
+        assert_ne!(session_a, session_b, "each client gets its own session");
+
+        // Instance listings come back as a text payload (arrays carry no
+        // structuredContent).
+        let listed = |response: &Value| -> Value {
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap()
+        };
+
+        // Listing works without a session and never shows passwords or
+        // usernames (the userid is the one identifier listings carry).
+        let shown = call(None, "show_credentials", json!({})).await;
         let text = shown["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
             .to_owned();
         assert!(text.contains("one.example"));
+        assert!(text.contains("user-one"));
         assert!(!text.contains("secret-one"));
-        assert_eq!(instances.snapshot().id.as_deref(), Some("one"));
+        assert!(!text.contains("login-one"));
+        assert_eq!(listed(&shown)[0]["currently_active"], true);
+        assert_eq!(listed(&shown)[1]["currently_active"], false);
 
-        let selected = call("choose_foundry_instance", json!({"_id":"two"})).await;
+        // A session's selection applies to that session only.
+        let selected = call(
+            Some(&session_a),
+            "choose_foundry_instance",
+            json!({"_id":"two"}),
+        )
+        .await;
         assert_eq!(selected["result"]["structuredContent"]["item_order"], 1);
-        assert_eq!(instances.snapshot().id.as_deref(), Some("two"));
+        assert_eq!(
+            selected["result"]["structuredContent"]["selected"], true,
+            "selection reports selection only, not a verified connection"
+        );
+        let shown = call(Some(&session_a), "show_credentials", json!({})).await;
+        assert_eq!(listed(&shown)[1]["currently_active"], true);
+        let shown = call(Some(&session_b), "show_credentials", json!({})).await;
+        assert_eq!(
+            listed(&shown)[0]["currently_active"],
+            true,
+            "one client's selection must be invisible to another's session"
+        );
+        let shown = call(None, "show_credentials", json!({})).await;
+        assert_eq!(listed(&shown)[0]["currently_active"], true);
 
-        let selected = call("choose_foundry_instance", json!({"item_order":0})).await;
-        assert_eq!(selected["result"]["structuredContent"]["item_order"], 0);
-        assert_eq!(instances.snapshot().hostname, "one.example");
-        assert!(
-            call("choose_foundry_instance", json!({"item_order":9})).await["result"]["isError"]
-                == true
-        );
-        assert!(
-            call("choose_foundry_instance", json!({"id":"missing"})).await["result"]["isError"]
-                == true
-        );
+        // Bad selections are refused without changing anything.
+        for arguments in [json!({"item_order":9}), json!({"id":"missing"}), json!({})] {
+            assert!(
+                call(Some(&session_a), "choose_foundry_instance", arguments).await["result"]
+                    ["isError"]
+                    == true
+            );
+        }
+
+        // Without a session there is no scope to remember a selection in.
+        let response = call(None, "choose_foundry_instance", json!({"_id":"two"})).await;
+        assert_eq!(response["result"]["isError"], true);
+        assert!(response["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("session"));
+
+        // Unknown or invented session ids are refused instead of silently
+        // falling back to someone else's scope.
+        let (status, _, _) = send(
+            Some("bogus-session-id"),
+            json!({"jsonrpc":"2.0","id":1,"method":"ping"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

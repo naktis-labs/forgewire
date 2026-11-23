@@ -1,9 +1,9 @@
 use anyhow::{anyhow, bail, Result};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use rand::RngCore;
 use serde_json::{json, Value};
 use tokio::time::timeout;
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tokio_tungstenite::tungstenite::protocol::Message;
 
 use crate::{
     socket_request, wait_for_session, FoundryClient, FoundryCredential, RESPONSE_TIMEOUT,
@@ -132,22 +132,25 @@ impl FoundryClient {
         kind: Option<&str>,
         extensions: Option<&[String]>,
     ) -> Result<Value> {
-        let (session, generation) = self.session(credential).await?;
+        let (session, generation, userid) = self.session(credential).await?;
         let request = socket_request(&credential.hostname, &session, generation)?;
-        let (mut socket, _) = timeout(SOCKET_CONNECT_TIMEOUT, connect_async(request))
+        let mut socket = timeout(SOCKET_CONNECT_TIMEOUT, crate::connect_socket(request))
             .await
             .map_err(|_| anyhow!("Foundry websocket connection timed out"))?
             .map_err(|_| anyhow!("Foundry websocket connection failed"))?;
-        timeout(SESSION_TIMEOUT, wait_for_session(&mut socket))
-            .await
-            .map_err(|_| anyhow!("Timed out waiting for Foundry session binding"))??;
+        timeout(
+            SESSION_TIMEOUT,
+            wait_for_session(&mut socket, &session, &userid),
+        )
+        .await
+        .map_err(|_| anyhow!("Timed out waiting for Foundry session binding"))??;
         let id = 1;
-        socket
-            .send(Message::Text(
-                browse_request(id, target, kind, extensions).into(),
-            ))
-            .await
-            .map_err(|_| anyhow!("Failed sending Foundry browse request"))?;
+        crate::send_message(
+            &mut socket,
+            Message::Text(browse_request(id, target, kind, extensions).into()),
+            "sending Foundry browse request",
+        )
+        .await?;
         timeout(RESPONSE_TIMEOUT, async {
             loop {
                 let frame = socket
@@ -160,11 +163,18 @@ impl FoundryClient {
                         bail!("Foundry browse response too large");
                     }
                     if text == "2" {
-                        socket
-                            .send(Message::Text("3".into()))
-                            .await
-                            .map_err(|_| anyhow!("Foundry pong failed"))?;
+                        crate::send_message(
+                            &mut socket,
+                            Message::Text("3".into()),
+                            "sending Foundry pong",
+                        )
+                        .await?;
                         continue;
+                    }
+                    if crate::is_namespace_disconnect_or_error(text.as_str()) {
+                        bail!(
+                            "Foundry Socket.IO namespace disconnected or rejected the connection"
+                        );
                     }
                     if let Some(response) = browse_ack(text.as_str(), id)? {
                         return Ok(response);
@@ -185,8 +195,8 @@ impl FoundryClient {
         data: &[u8],
     ) -> Result<Value> {
         validate_upload(target, filename, data.len())?;
-        let (session, _) = self.session(credential).await?;
-        let url = Self::host_url(&credential.hostname, "/upload")?;
+        let (session, _, _) = self.session(credential).await?;
+        let url = self.url_for(&credential.hostname, "/upload")?;
         let origin = url.origin().ascii_serialization();
         let mut random = [0u8; 16];
         rand::thread_rng().fill_bytes(&mut random);
@@ -210,23 +220,24 @@ impl FoundryClient {
             .body(body)
             .send()
             .await
-            .map_err(|_| anyhow!("Foundry upload request failed"))?;
+            .map_err(|_| {
+                anyhow!("Foundry upload request failed; the upload may have been applied")
+            })?;
         let status = response.status();
         let mut bytes = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| anyhow!("Foundry upload response failed"))?
-        {
+        while let Some(chunk) = response.chunk().await.map_err(|_| {
+            anyhow!("Foundry upload response failed; the upload may have been applied")
+        })? {
             if chunk.len() > MAX_RESPONSE_BYTES.saturating_sub(bytes.len()) {
-                bail!("Foundry upload response too large");
+                bail!("Foundry upload response too large; the upload may have been applied");
             }
             bytes.extend_from_slice(&chunk);
         }
         if !status.is_success() {
-            bail!("Foundry upload failed with status {status}");
+            bail!("Foundry upload failed with status {status}; the upload may have been applied");
         }
         parse_upload_response(&bytes)
+            .map_err(|error| anyhow!("{error}; the upload may have been applied"))
     }
 }
 

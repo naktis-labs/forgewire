@@ -28,7 +28,7 @@ Retain default-disabled writes, strict acknowledgement validation, bounded uploa
 
 Replace per-operation socket creation with a reusable, authenticated Socket.IO / Engine.IO v4 connection per configured Foundry identity. Its lifecycle is independent of incoming REST or MCP requests.
 
-- Authenticate with `/join`, detect v13/v14 binding differences, and verify the bound `session` event before marking a connection ready.
+- Authenticate with `/join`, detect v13/v14 binding differences, and verify the bound `session` event before marking a connection ready. Require an exact `sessionId`; if `userId` is present it must be a matching string, but accept its absence for Foundry compatibility. Without that field the event verifies the session, not the user identity.
 - Run a **single inbound frame reader** and serialized sender. Handle Engine.IO ping/pong, protocol controls, world responses, and ACK-bearing replies.
 - Assign distinct IDs to concurrent requests. Route `43<ack>[...]` replies through a bounded pending-request registry; accommodate the protocol's special `430` world response without confusing concurrent world requests.
 - Forward unsolicited frames to an **internal** bounded event interface; unknown frames must not disrupt request handling. This is a protocol foundation, not a journal synchronization engine.

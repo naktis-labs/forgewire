@@ -1,8 +1,8 @@
 use anyhow::{anyhow, bail, Result};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use serde_json::{json, Value};
 use tokio::time::timeout;
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tokio_tungstenite::tungstenite::protocol::Message;
 
 use crate::{read_ops, FoundryClient, FoundryCredential};
 
@@ -61,29 +61,42 @@ impl FoundryClient {
         action: &str,
         data: Value,
     ) -> Result<Value> {
-        let (session, generation) = self.session(credential).await?;
+        let (session, generation, userid) = self.session(credential).await?;
         let request = crate::socket_request(&credential.hostname, &session, generation)?;
-        let (mut socket, _) = timeout(crate::SOCKET_CONNECT_TIMEOUT, connect_async(request))
-            .await
-            .map_err(|_| anyhow!("Foundry websocket connection timed out"))?
-            .map_err(|_| anyhow!("Foundry websocket connection failed"))?;
-        timeout(crate::SESSION_TIMEOUT, crate::wait_for_session(&mut socket))
-            .await
-            .map_err(|_| anyhow!("Timed out waiting for Foundry session binding"))??;
+        let mut socket = timeout(
+            crate::SOCKET_CONNECT_TIMEOUT,
+            crate::connect_socket(request),
+        )
+        .await
+        .map_err(|_| anyhow!("Foundry websocket connection timed out"))?
+        .map_err(|_| anyhow!("Foundry websocket connection failed"))?;
+        timeout(
+            crate::SESSION_TIMEOUT,
+            crate::wait_for_session(&mut socket, &session, &userid),
+        )
+        .await
+        .map_err(|_| anyhow!("Timed out waiting for Foundry session binding"))??;
         let payload = management_payload(action, data);
-        socket
-            .send(Message::Text(format!("421{payload}").into()))
-            .await
-            .map_err(|_| {
-                anyhow!("Failed sending compendium request; the operation may have been applied")
-            })?;
+        crate::send_message(
+            &mut socket,
+            Message::Text(format!("421{payload}").into()),
+            "sending compendium request; the operation may have been applied",
+        )
+        .await?;
         timeout(crate::RESPONSE_TIMEOUT, async {
             loop {
                 let frame = socket.next().await.ok_or_else(|| anyhow!("Foundry socket closed; the operation may have been applied"))?
                     .map_err(|_| anyhow!("Foundry socket read failed; the operation may have been applied"))?;
                 if let Message::Text(text) = frame {
                     if text == "2" {
-                        socket.send(Message::Text("3".into())).await.map_err(|_| anyhow!("Foundry pong failed; the operation may have been applied"))?;
+                        crate::send_message(
+                            &mut socket,
+                            Message::Text("3".into()),
+                            "sending Foundry pong; the operation may have been applied",
+                        )
+                        .await?;
+                    } else if crate::is_namespace_disconnect_or_error(text.as_str()) {
+                        bail!("Foundry Socket.IO namespace disconnected or rejected the connection; the operation may have been applied");
                     } else if let Some(response) = management_ack(text.as_str(), 1, action)? {
                         return Ok(response);
                     }
