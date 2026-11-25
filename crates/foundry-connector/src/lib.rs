@@ -101,9 +101,29 @@ pub struct FoundryClient {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct WorldInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub title: Option<String>,
     pub system: Option<String>,
     pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub world_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_generation: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_build: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authors: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub background: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub modules: Vec<Value>,
 }
 
 fn generate_session_id() -> String {
@@ -316,7 +336,9 @@ fn session_event(frame: &str, expected_session: &str, expected_user: &str) -> Op
     Some(if session_matches && user_matches {
         Ok(())
     } else {
-        Err(anyhow!("Foundry websocket session binding failed"))
+        Err(connection::mark_terminal(anyhow!(
+            "Foundry websocket session binding failed"
+        )))
     })
 }
 
@@ -491,23 +513,123 @@ fn world_response(frame: &str) -> Result<Value> {
         .ok_or_else(|| anyhow!("Foundry world response did not contain metadata"))
 }
 
+fn bounded_string(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let end = value
+        .char_indices()
+        .take_while(|(index, character)| index + character.len_utf8() <= 256)
+        .map(|(index, character)| index + character.len_utf8())
+        .last()
+        .unwrap_or(0);
+    Some(value[..end].to_owned())
+}
+
+fn safe_authors(value: Option<&Value>) -> Option<Value> {
+    let authors = value?;
+    let entries = authors
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_else(|| std::slice::from_ref(authors));
+    let safe = entries
+        .iter()
+        .filter_map(|author| {
+            let mut output = serde_json::Map::new();
+            if let Some(name) = author.as_str().and_then(bounded_string) {
+                output.insert("name".to_owned(), Value::String(name));
+            } else if let Some(object) = author.as_object() {
+                for key in ["name", "url"] {
+                    if let Some(value) = object
+                        .get(key)
+                        .and_then(Value::as_str)
+                        .and_then(bounded_string)
+                    {
+                        output.insert(key.to_owned(), Value::String(value));
+                    }
+                }
+            }
+            (!output.is_empty()).then_some(Value::Object(output))
+        })
+        .take(20)
+        .collect();
+    Some(Value::Array(safe))
+}
+
+fn safe_modules(value: Option<&Value>) -> Vec<Value> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|module| {
+            let object = module.as_object()?;
+            let mut output = serde_json::Map::new();
+            for key in ["id", "title", "description", "url", "version"] {
+                if let Some(value) = object
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .and_then(bounded_string)
+                {
+                    output.insert(key.to_owned(), Value::String(value));
+                }
+            }
+            if let Some(authors) = safe_authors(object.get("authors")) {
+                output.insert("authors".to_owned(), authors);
+            }
+            (!output.is_empty()).then_some(Value::Object(output))
+        })
+        .take(100)
+        .collect()
+}
+
 fn world_info(result: &Value) -> WorldInfo {
     let meta = result
         .get("world")
         .or_else(|| result.get("meta"))
         .unwrap_or(result);
     WorldInfo {
-        title: meta.get("title").and_then(Value::as_str).map(str::to_owned),
-        system: meta
-            .get("system")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        version: meta
-            .get("coreVersion")
-            .or_else(|| meta.get("version"))
-            .and_then(Value::as_str)
-            .map(str::to_owned),
+        id: world_string(meta, "id"),
+        title: world_string(meta, "title"),
+        system: world_string(meta, "system"),
+        version: world_string_fallback(meta, &["coreVersion", "version"]),
+        world_version: world_string(meta, "coreVersion")
+            .and_then(|_| world_string(meta, "version")),
+        release_generation: bounded_number(
+            result
+                .get("release")
+                .and_then(|release| release.get("generation")),
+        ),
+        release_build: bounded_number(
+            result
+                .get("release")
+                .and_then(|release| release.get("build")),
+        ),
+        description: world_string(meta, "description"),
+        authors: safe_authors(meta.get("authors")),
+        url: world_string(meta, "url"),
+        system_version: world_string(meta, "systemVersion"),
+        background: world_string(meta, "background"),
+        modules: safe_modules(result.get("modules")),
     }
+}
+
+fn bounded_number(value: Option<&Value>) -> Option<Value> {
+    match value? {
+        Value::Number(number) if number.is_u64() => Some(Value::Number(number.clone())),
+        Value::String(value) => bounded_string(value).map(Value::String),
+        _ => None,
+    }
+}
+
+fn world_string(meta: &Value, key: &str) -> Option<String> {
+    meta.get(key)
+        .and_then(Value::as_str)
+        .and_then(bounded_string)
+}
+
+fn world_string_fallback(meta: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| world_string(meta, key))
 }
 
 impl FoundryClient {
@@ -575,7 +697,9 @@ impl FoundryClient {
                 .as_deref()
                 .is_none_or(|v| v.trim().is_empty())
         {
-            bail!("Foundry credential requires a userid or username");
+            return Err(connection::mark_terminal(anyhow!(
+                "Foundry credential requires a userid or username"
+            )));
         }
         let status = match timeout(
             HTTP_TIMEOUT,
@@ -627,7 +751,9 @@ impl FoundryClient {
             .join_users(&credential.hostname, &session, generation)
             .await?
         {
-            Some(users) => resolve_identity(&mut credential, &users)?,
+            Some(users) => {
+                resolve_identity(&mut credential, &users).map_err(connection::mark_terminal)?
+            }
             None if has_complete_identity(&credential) => {}
             None => {
                 bail!("Foundry join user data is unavailable; cannot resolve the missing identity")
@@ -648,17 +774,24 @@ impl FoundryClient {
             .send()
             .await
             .map_err(|_| anyhow!("Foundry authentication request failed or timed out"))?;
-        let body: Value = if auth.status().is_success() {
-            auth.json().await.unwrap_or(Value::Null)
-        } else {
-            Value::Null
-        };
-        if body.get("status").and_then(Value::as_str) != Some("success") {
-            bail!("Foundry authentication failed");
+        let status = auth.status();
+        if !status.is_success() {
+            if status.is_server_error() || matches!(status.as_u16(), 408 | 425 | 429) {
+                bail!("Foundry authentication request returned transient status {status}");
+            }
+            return Err(connection::mark_terminal(anyhow!(
+                "Foundry authentication failed (HTTP status {status})"
+            )));
         }
-        let userid = credential
-            .userid
-            .ok_or_else(|| anyhow!("Foundry credential requires a userid"))?;
+        let body: Value = auth.json().await.unwrap_or(Value::Null);
+        if body.get("status").and_then(Value::as_str) != Some("success") {
+            return Err(connection::mark_terminal(anyhow!(
+                "Foundry authentication failed"
+            )));
+        }
+        let userid = credential.userid.ok_or_else(|| {
+            connection::mark_terminal(anyhow!("Foundry credential requires a userid"))
+        })?;
         Ok((session, generation, userid))
     }
 
@@ -686,13 +819,13 @@ impl FoundryClient {
         };
         let mut socket = match timeout(SOCKET_CONNECT_TIMEOUT, connect_socket(request)).await {
             Ok(Ok(socket)) => socket,
-            _ => return Ok(None),
+            Ok(Err(_)) | Err(_) => return Ok(None),
         };
         let result = match timeout(SESSION_TIMEOUT, async {
             loop {
                 let frame = match socket.next().await {
                     Some(Ok(frame)) => frame,
-                    _ => return Ok(None),
+                    Some(Err(_)) | None => return Ok(None),
                 };
                 if let Message::Text(text) = frame {
                     if text.starts_with("0{") {
@@ -721,15 +854,20 @@ impl FoundryClient {
                         )
                         .await?;
                     } else if text.starts_with("431[") {
-                        let data: Value = serde_json::from_str(&text[3..])
-                            .map_err(|_| anyhow!("invalid Foundry join data response"))?;
+                        let data: Value = serde_json::from_str(&text[3..]).map_err(|_| {
+                            connection::mark_terminal(anyhow!("invalid Foundry join data response"))
+                        })?;
                         return data
                             .get(0)
                             .and_then(|v| v.get("users"))
                             .and_then(Value::as_array)
                             .cloned()
                             .map(Some)
-                            .ok_or_else(|| anyhow!("Foundry join data did not contain users"));
+                            .ok_or_else(|| {
+                                connection::mark_terminal(anyhow!(
+                                    "Foundry join data did not contain users"
+                                ))
+                            });
                     }
                 }
             }
@@ -1585,6 +1723,104 @@ mod tests {
         assert_eq!(info.title.as_deref(), Some("My World"));
         assert_eq!(info.system.as_deref(), Some("mta"));
         assert_eq!(info.version.as_deref(), Some("14.370"));
+    }
+
+    #[test]
+    fn world_metadata_includes_safe_reference_fields_and_bounded_modules() {
+        let info = world_info(&json!({
+            "world": {
+                "id": "summerlands",
+                "title": " Summerlands ",
+                "system": " dnd5e ",
+                "coreVersion": "14.370",
+                "version": " 2.1.0 ",
+                "systemVersion": " 4.3.1 ",
+                "description": " A world ",
+                "authors": [{"name":" A. Author ","url":" https://author.test ","email":"private@example.test"}],
+                "url": "https://example.test/world",
+                "background": "worlds/summerlands/bg.webp",
+                "actors": [{"name": "Must not leak"}],
+                "users": [{"password": "secret"}],
+                "session": {"userId": "secret"},
+                "password": "secret"
+            },
+            "modules": [
+                {"id":" module-a ","title":" Module A ","description":" A module ","authors":[{"name":" Dev ","email":"private@example.test"}],"url":" https://module.test ","version":" 1.2 ","token":"secret"},
+                {"id":"module-b","title":"Module B","description":"B","version":"2"}
+            ],
+            "scenes": [{"name":"Must not leak"}],
+            "settings": {"private":"secret"},
+            "users": [{"password":"secret"}]
+        }));
+
+        assert_eq!(info.title.as_deref(), Some("Summerlands"));
+        assert_eq!(info.system.as_deref(), Some("dnd5e"));
+        assert_eq!(info.version.as_deref(), Some("14.370"));
+        assert_eq!(info.world_version.as_deref(), Some("2.1.0"));
+        assert_eq!(info.id.as_deref(), Some("summerlands"));
+        assert_eq!(info.system_version.as_deref(), Some("4.3.1"));
+        assert_eq!(info.description.as_deref(), Some("A world"));
+        assert_eq!(
+            info.authors,
+            Some(json!([{"name":"A. Author","url":"https://author.test"}]))
+        );
+        assert_eq!(info.url.as_deref(), Some("https://example.test/world"));
+        assert_eq!(
+            info.background.as_deref(),
+            Some("worlds/summerlands/bg.webp")
+        );
+        assert_eq!(info.modules.len(), 2);
+        assert_eq!(info.modules[0]["id"], "module-a");
+        assert_eq!(info.modules[0]["title"], "Module A");
+        assert_eq!(info.modules[0]["description"], "A module");
+        assert_eq!(info.modules[0]["version"], "1.2");
+        assert_eq!(info.modules[0]["authors"], json!([{"name":"Dev"}]));
+        assert!(info.modules[0].get("token").is_none());
+        let output = serde_json::to_value(info).unwrap();
+        for excluded in [
+            "actors", "users", "session", "password", "scenes", "settings",
+        ] {
+            assert!(output.get(excluded).is_none(), "{excluded} leaked");
+        }
+        assert!(!output.to_string().contains("private@example.test"));
+    }
+
+    #[test]
+    fn world_metadata_bounds_fields_and_filters_invalid_entries_before_caps() {
+        let long = "é".repeat(400);
+        let modules = std::iter::once(json!(null))
+            .chain(std::iter::once(json!("invalid")))
+            .chain(std::iter::once(json!({"token":"secret"})))
+            .chain(std::iter::once(json!({"id":long})))
+            .chain((0..150).map(|i| json!({"id":format!("module-{i}"),"title":long})))
+            .collect::<Vec<_>>();
+        let input = json!({
+            "world": {
+                "title": long,
+                "authors": [null, 7, {"email":"private@example.test"}, " String Author ", {"name":long}]
+            },
+            "modules": modules,
+            "release": {"generation": 14, "build": 370, "secret": "omit"}
+        });
+        let info = world_info(&input);
+        assert_eq!(info.title.as_ref().unwrap().chars().count(), 128);
+        assert_eq!(info.title.as_ref().unwrap().len(), 256);
+        let authors = info.authors.as_ref().unwrap().as_array().unwrap();
+        assert_eq!(authors.len(), 2);
+        assert_eq!(authors[0]["name"], "String Author");
+        assert_eq!(authors[1]["name"].as_str().unwrap().chars().count(), 128);
+        assert_eq!(authors[1]["name"].as_str().unwrap().len(), 256);
+        assert_eq!(info.modules.len(), 100);
+        assert_eq!(info.modules[0]["id"].as_str().unwrap().chars().count(), 128);
+        assert_eq!(info.modules[0]["id"].as_str().unwrap().len(), 256);
+        assert_eq!(info.modules[1]["id"], "module-0");
+        assert_eq!(info.release_generation, Some(json!(14)));
+        assert_eq!(info.release_build, Some(json!(370)));
+        let output = serde_json::to_value(&info).unwrap();
+        assert!(output["title"].as_str().unwrap().len() < 512);
+        assert_eq!(output["modules"].as_array().unwrap().len(), 100);
+        assert!(!output.to_string().contains("private@example.test"));
+        assert!(output["release"].is_null());
     }
 
     #[test]

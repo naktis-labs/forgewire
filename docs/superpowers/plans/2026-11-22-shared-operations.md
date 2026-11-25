@@ -25,6 +25,10 @@
 - One MCP client selecting an instance must not redirect another client, a REST request or an in-flight operation.
 - Both adapters must reject malformed inputs and disabled writes consistently while mapping domain errors to appropriate transport outcomes.
 
+## Current execution status
+
+The packages below are the original acceptance checklist, not a claim that every item is complete. Shared operations, instance isolation, persistent read sockets, bounded reconnect and fake-server/transport tests have been implemented and independently reviewed in increments. The capability inventory records partial metadata parity, per-operation mutation and file sockets, deferred URL uploads, insecure TLS, and live verification gaps. The latest authentication-status fix passed scoped review; the inventory records residual retry and coverage limitations. Live mutations and uploads have not been authorized or tested. Consult the inventory for current evidence rather than interpreting unchecked historical tasks as a fresh work queue.
+
 ## Work packages
 
 Each package starts with focused failing tests, implements the smallest coherent change, and finishes with its targeted tests. Sequence the packages as shown where their interfaces depend on prior work. File paths for new modules are implementation boundaries, not a requirement to preserve current MCP-oriented names.

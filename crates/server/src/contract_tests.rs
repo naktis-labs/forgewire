@@ -76,7 +76,24 @@ impl FakeConnector {
 impl operations::Connector for FakeConnector {
     async fn world(&self, target: &FoundryCredential) -> anyhow::Result<Value> {
         self.record(format!("world:{}", target.hostname));
-        Ok(json!({"title": "Test World", "system": "dnd5e", "version": "13"}))
+        Ok(json!({
+            "id": "world-id",
+            "title": "Metadata World",
+            "system": "dnd5e",
+            "version": "13",
+            "world_version": "2.1.0",
+            "release_generation": 14,
+            "release_build": 370,
+            "description": "A richly described test world",
+            "authors": [{"name":"A. Author","url":"https://author.test"}],
+            "modules": [{
+                "id": "module-a",
+                "title": "Module A",
+                "description": "A module",
+                "version": "1.2",
+                "authors": [{"name":"Module Author"}]
+            }]
+        }))
     }
 
     async fn list_documents(
@@ -419,6 +436,39 @@ fn assert_transports_matched(fake: &FakeConnector) {
         tail[0], tail[1],
         "REST and MCP must drive identical application calls"
     );
+}
+
+#[tokio::test]
+async fn rest_and_mcp_preserve_extended_world_metadata() {
+    let (router, fake) = contract_app(false);
+
+    let (status, rest) = rest_get(&router, "/api/world").await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, mcp) = mcp_call(&router, "get_world", json!({})).await;
+    assert_eq!(mcp["result"]["isError"], false);
+
+    let expected = json!({
+        "id": "world-id",
+        "title": "Metadata World",
+        "system": "dnd5e",
+        "version": "13",
+        "world_version": "2.1.0",
+        "release_generation": 14,
+        "release_build": 370,
+        "description": "A richly described test world",
+        "authors": [{"name":"A. Author","url":"https://author.test"}],
+        "modules": [{
+            "id": "module-a",
+            "title": "Module A",
+            "description": "A module",
+            "version": "1.2",
+            "authors": [{"name":"Module Author"}]
+        }]
+    });
+    assert_eq!(rest, expected);
+    assert_eq!(mcp_value(&mcp), expected);
+    assert_eq!(rest, mcp_value(&mcp));
+    assert_transports_matched(&fake);
 }
 
 #[tokio::test]

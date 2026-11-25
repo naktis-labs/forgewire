@@ -1,5 +1,5 @@
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 
@@ -26,7 +26,16 @@ struct FakeState {
     binding: Value,
     join_data: Option<Value>,
     next_socket: AtomicUsize,
+    disconnect_socket: AtomicUsize,
+    fail_authentication: AtomicBool,
+    auth_non_success_success_body: AtomicBool,
+    auth_transient_status: AtomicUsize,
+    auth_transient_attempts: AtomicUsize,
+    join_data_transport_failures: AtomicUsize,
     world_delay_ms: AtomicUsize,
+    hold_document_acks: AtomicBool,
+    document_requests: tokio::sync::Semaphore,
+    release_document_acks: tokio::sync::Semaphore,
     namespace_after_world: Mutex<Option<String>>,
 }
 
@@ -86,7 +95,16 @@ impl FakeFoundry {
             binding,
             join_data,
             next_socket: AtomicUsize::new(1),
+            disconnect_socket: AtomicUsize::new(0),
+            fail_authentication: AtomicBool::new(false),
+            auth_non_success_success_body: AtomicBool::new(false),
+            auth_transient_status: AtomicUsize::new(0),
+            auth_transient_attempts: AtomicUsize::new(0),
+            join_data_transport_failures: AtomicUsize::new(0),
             world_delay_ms: AtomicUsize::new(0),
+            hold_document_acks: AtomicBool::new(false),
+            document_requests: tokio::sync::Semaphore::new(0),
+            release_document_acks: tokio::sync::Semaphore::new(0),
             namespace_after_world: Mutex::new(None),
         });
         let app = Router::new()
@@ -146,6 +164,29 @@ async fn authenticate(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
+    let remaining_transient = state.auth_transient_attempts.load(Ordering::Acquire);
+    if remaining_transient > 0
+        && state
+            .auth_transient_attempts
+            .compare_exchange(
+                remaining_transient,
+                remaining_transient - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    {
+        let status = axum::http::StatusCode::from_u16(
+            state.auth_transient_status.load(Ordering::Acquire) as u16,
+        )
+        .unwrap();
+        state
+            .requests
+            .lock()
+            .unwrap()
+            .push(format!("POST /join status={}", status.as_u16()));
+        return (status, Json(json!({"status":"temporarily unavailable"})));
+    }
     let origin = headers
         .get("origin")
         .and_then(|v| v.to_str().ok())
@@ -170,7 +211,16 @@ async fn authenticate(
         cookie == expected_cookie,
         fields_match,
     ));
-    if origin == expected_origin && cookie == expected_cookie && fields_match {
+    if state.auth_non_success_success_body.load(Ordering::Acquire) {
+        (
+            axum::http::StatusCode::UNAUTHORIZED,
+            Json(json!({"status":"success"})),
+        )
+    } else if !state.fail_authentication.load(Ordering::Acquire)
+        && origin == expected_origin
+        && cookie == expected_cookie
+        && fields_match
+    {
         (
             axum::http::StatusCode::OK,
             Json(json!({"status":"success"})),
@@ -220,6 +270,15 @@ async fn socket_session(mut socket: WebSocket, state: Arc<FakeState>, socket_id:
                 .lock()
                 .unwrap()
                 .push(format!("WS {text} socket={socket_id}"));
+            if state.disconnect_socket.load(Ordering::Acquire) == socket_id {
+                state
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .push(format!("WS-CLOSE socket={socket_id}"));
+                let _ = sink.lock().await.send(AxumMessage::Close(None)).await;
+                return;
+            }
             let delay = state.world_delay_ms.load(Ordering::Relaxed);
             let sink = sink.clone();
             let state = state.clone();
@@ -253,6 +312,21 @@ async fn socket_session(mut socket: WebSocket, state: Arc<FakeState>, socket_id:
             });
         } else if text.contains("[\"getJoinData\"]") {
             state.requests.lock().unwrap().push(format!("WS {text}"));
+            let remaining_failures = state.join_data_transport_failures.load(Ordering::Acquire);
+            if remaining_failures > 0
+                && state
+                    .join_data_transport_failures
+                    .compare_exchange(
+                        remaining_failures,
+                        remaining_failures - 1,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+            {
+                let _ = sink.lock().await.send(AxumMessage::Close(None)).await;
+                return;
+            }
             let Some(join_data) = &state.join_data else {
                 return;
             };
@@ -285,11 +359,20 @@ async fn socket_session(mut socket: WebSocket, state: Arc<FakeState>, socket_id:
                 "43{ack}[{}]",
                 json!({"type":document,"result":[{"_id":"doc","name":document}]})
             );
-            let delay = if document == "Actor" { 300 } else { 10 };
+            let hold_ack = state.hold_document_acks.load(Ordering::Acquire);
+            if hold_ack {
+                state.document_requests.add_permits(1);
+            }
             let sink = sink.clone();
             let state = state.clone();
             tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                if hold_ack {
+                    let permit = state.release_document_acks.acquire().await.unwrap();
+                    permit.forget();
+                } else {
+                    let delay = if document == "Actor" { 300 } else { 10 };
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                }
                 state
                     .requests
                     .lock()
@@ -399,6 +482,15 @@ async fn rejects_unresolvable_ambiguous_and_inconsistent_join_identities() {
     for (credential, users, expected) in [
         (
             FoundryCredential {
+                userid: Some("user-1".into()),
+                username: Some(" ".into()),
+                ..test_credential("unused")
+            },
+            vec![json!({"_id":"user-1","name":"Test User"})],
+            "must not be blank",
+        ),
+        (
+            FoundryCredential {
                 userid: None,
                 ..test_credential("unused")
             },
@@ -437,7 +529,156 @@ async fn rejects_unresolvable_ambiguous_and_inconsistent_join_identities() {
             error.contains(expected),
             "expected {expected:?}, got {error}"
         );
+        let request_count = fake
+            .requests
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| *request == "GET /join")
+            .count();
+        assert_eq!(request_count, 1, "terminal identity error retried: {error}");
     }
+}
+
+#[tokio::test]
+async fn terminal_authentication_failure_is_not_retried_by_world_connection() {
+    let fake = FakeFoundry::start("430[{\"world\":{}}]", 14, "s-test").await;
+    fake.requests
+        .fail_authentication
+        .store(true, Ordering::Release);
+    let client = FoundryClient::for_test(&fake.base_url).unwrap();
+    let credential = test_credential(&fake.base_url);
+
+    let error = client.world(&credential).await.unwrap_err().to_string();
+    assert!(error.contains("Foundry authentication failed"), "{error}");
+    let requests = fake.requests.requests.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| *request == "GET /join")
+            .count(),
+        1
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.starts_with("POST /join "))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn partial_identity_retries_after_join_data_transport_failure() {
+    let fake = FakeFoundry::start("430[{\"world\":{}}]", 14, "s-test").await;
+    fake.requests
+        .join_data_transport_failures
+        .store(1, Ordering::Release);
+    let client = FoundryClient::for_test(&fake.base_url).unwrap();
+    let credential = FoundryCredential {
+        userid: None,
+        ..test_credential(&fake.base_url)
+    };
+
+    client.world(&credential).await.unwrap();
+
+    let requests = fake.requests.requests.lock().unwrap();
+    assert_eq!(requests.iter().filter(|r| *r == "GET /join").count(), 2);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.starts_with("POST /join "))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn authentication_non_success_status_with_success_body_is_rejected() {
+    let fake = FakeFoundry::start("430[{\"world\":{}}]", 14, "s-test").await;
+    fake.requests
+        .auth_non_success_success_body
+        .store(true, Ordering::Release);
+    let client = FoundryClient::for_test(&fake.base_url).unwrap();
+
+    let error = client
+        .world(&test_credential(&fake.base_url))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("Foundry authentication failed"), "{error}");
+    let requests = fake.requests.requests.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.starts_with("POST /join "))
+            .count(),
+        1,
+        "non-success status must not be accepted or retried: {requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn transient_authentication_statuses_are_retried() {
+    for status in [408, 425, 429, 500, 503] {
+        let fake = FakeFoundry::start("430[{\"world\":{}}]", 14, "s-test").await;
+        fake.requests
+            .auth_transient_status
+            .store(status, Ordering::Release);
+        fake.requests
+            .auth_transient_attempts
+            .store(1, Ordering::Release);
+        let client = FoundryClient::for_test(&fake.base_url).unwrap();
+
+        client
+            .world(&test_credential(&fake.base_url))
+            .await
+            .unwrap_or_else(|error| panic!("status {status} should retry: {error}"));
+
+        let requests = fake.requests.requests.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.starts_with("POST /join "))
+                .count(),
+            2,
+            "status {status}: {requests:?}"
+        );
+        assert_eq!(
+            requests.iter().filter(|r| *r == "GET /join").count(),
+            2,
+            "status {status}: {requests:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn malformed_join_data_is_not_retried() {
+    let fake = FakeFoundry::start_with_join_data(
+        "430[{\"world\":{}}]",
+        14,
+        "s-test",
+        Some(json!({"notUsers": []})),
+    )
+    .await;
+    let client = FoundryClient::for_test(&fake.base_url).unwrap();
+
+    let error = client
+        .world(&test_credential(&fake.base_url))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("did not contain users"), "{error}");
+    let requests = fake.requests.requests.lock().unwrap();
+    assert_eq!(requests.iter().filter(|r| *r == "GET /join").count(), 1);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.starts_with("POST /join "))
+            .count(),
+        0
+    );
 }
 
 #[tokio::test]
@@ -469,6 +710,46 @@ async fn foundry_client_world_read_reaches_fake_over_http_and_socket() {
         .any(|r| r.starts_with("WS cookie_present=true")
             && r.contains("/socket.io/?EIO=4&transport=websocket")));
     assert!(requests.iter().any(|r| r.starts_with("WS 420[\"world\"]")));
+}
+
+#[tokio::test]
+async fn disconnect_is_not_replayed_and_next_read_reconnects_with_bound_session() {
+    let fake = FakeFoundry::start("430[{\"world\":{\"title\":\"fresh\"}}]", 14, "s-test").await;
+    fake.requests.disconnect_socket.store(2, Ordering::Release);
+    let client = FoundryClient::for_test(&fake.base_url).unwrap();
+    let credential = test_credential(&fake.base_url);
+
+    let first_error = client.world(&credential).await.unwrap_err().to_string();
+    assert!(first_error.contains("disconnected"), "{first_error}");
+    let world = client.world(&credential).await.unwrap();
+    assert_eq!(world.title.as_deref(), Some("fresh"));
+
+    let requests = fake.requests.requests.lock().unwrap();
+    let world_requests: Vec<_> = requests
+        .iter()
+        .filter(|request| request.starts_with("WS 420[\"world\"]"))
+        .collect();
+    assert_eq!(world_requests.len(), 2, "{requests:?}");
+    let first_socket = world_requests[0].split("socket=").nth(1).unwrap();
+    let second_socket = world_requests[1].split("socket=").nth(1).unwrap();
+    assert_ne!(first_socket, second_socket);
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| *request == "GET /join")
+            .count(),
+        2
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.starts_with("POST /join "))
+            .count(),
+        2
+    );
+    assert!(requests
+        .iter()
+        .all(|request| { !request.starts_with("WS-CLOSE") || request == "WS-CLOSE socket=2" }));
 }
 
 #[tokio::test]
@@ -641,6 +922,96 @@ async fn concurrent_world_and_document_reads_share_one_authenticated_socket() {
         item_ack < world_ack && world_ack < actor_ack,
         "responses were not interleaved: {requests:?}"
     );
+}
+
+#[tokio::test]
+async fn overlapping_world_calls_serialize_on_the_shared_socket() {
+    let fake = FakeFoundry::start("430[{\"world\":{\"title\":\"Shared\"}}]", 14, "s-test").await;
+    fake.requests.world_delay_ms.store(100, Ordering::Relaxed);
+    let client = FoundryClient::for_test(&fake.base_url).unwrap();
+    let credential = test_credential(&fake.base_url);
+
+    let (first, second) = tokio::join!(client.world(&credential), client.world(&credential),);
+    assert_eq!(first.unwrap().title.as_deref(), Some("Shared"));
+    assert_eq!(second.unwrap().title.as_deref(), Some("Shared"));
+
+    let requests = fake.requests.requests.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|r| r.starts_with("WS 420[\"world\"]"))
+            .count(),
+        2,
+        "both world reads should be sent: {requests:?}"
+    );
+    let sockets: std::collections::HashSet<_> = requests
+        .iter()
+        .filter(|r| r.starts_with("WS 420[\"world\"]"))
+        .filter_map(|r| r.split("socket=").nth(1))
+        .collect();
+    assert_eq!(
+        sockets.len(),
+        1,
+        "world reads should reuse the socket: {requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn pending_cap_rejection_does_not_discard_transport_or_existing_reads() {
+    let fake = FakeFoundry::start("430[{\"world\":{}}]", 14, "s-test").await;
+    fake.requests
+        .hold_document_acks
+        .store(true, Ordering::Release);
+    let client = FoundryClient::for_test(&fake.base_url).unwrap();
+    let credential = test_credential(&fake.base_url);
+
+    let reads: Vec<_> = (0..128)
+        .map(|_| {
+            let client = client.clone();
+            let credential = credential.clone();
+            tokio::spawn(async move { client.list_documents(&credential, "actors").await })
+        })
+        .collect();
+    for _ in 0..128 {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fake.requests.document_requests.acquire(),
+        )
+        .await
+        .expect("all document requests should reach fake Foundry")
+        .unwrap()
+        .forget();
+    }
+
+    let world_error = client.world(&credential).await.unwrap_err().to_string();
+    assert!(
+        world_error.contains("pending request limit reached"),
+        "{world_error}"
+    );
+
+    fake.requests.release_document_acks.add_permits(128);
+    let results = futures_util::future::join_all(reads).await;
+    assert!(results
+        .iter()
+        .all(|result| result.as_ref().unwrap().is_ok()));
+    fake.requests
+        .hold_document_acks
+        .store(false, Ordering::Release);
+
+    client.list_documents(&credential, "items").await.unwrap();
+
+    let requests = fake.requests.requests.lock().unwrap();
+    let sockets: std::collections::HashSet<_> = requests
+        .iter()
+        .filter(|r| r.contains("modifyDocument"))
+        .filter_map(|r| r.split("socket=").nth(1))
+        .collect();
+    assert_eq!(
+        sockets.len(),
+        1,
+        "cap rejection must preserve transport: {requests:?}"
+    );
+    assert!(!requests.iter().any(|r| r.starts_with("WS 420[\"world\"]")));
 }
 
 #[tokio::test]

@@ -19,4 +19,4 @@ url.workspace = true
 
 [dev-dependencies]
 axum = { version = "0.8", features = ["ws"] }
-tokio.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

@@ -45,7 +45,9 @@ impl IdentityKey {
 
 struct Connection {
     transport: Mutex<Option<Transport>>,
-    invalid: Arc<AtomicBool>,
+    world_gate: Mutex<()>,
+    epoch: Arc<std::sync::atomic::AtomicU64>,
+    next_epoch: std::sync::atomic::AtomicU64,
     last_used: std::sync::atomic::AtomicU64,
 }
 
@@ -58,12 +60,42 @@ struct Outbound {
 struct Transport {
     sender: mpsc::Sender<Outbound>,
     mux: crate::socket_mux::SocketMux,
+    epoch: u64,
+}
+
+#[derive(Clone, Copy)]
+struct ReconnectPolicy {
+    attempts: usize,
+    initial_delay: Duration,
+    max_delay: Duration,
+    max_jitter: Duration,
+    attempt_timeout: Duration,
+    total_timeout: Duration,
+}
+
+impl Default for ReconnectPolicy {
+    fn default() -> Self {
+        Self {
+            attempts: 3,
+            initial_delay: Duration::from_millis(100),
+            max_delay: Duration::from_secs(1),
+            max_jitter: Duration::from_millis(500),
+            // A fresh identity setup can use five HTTP calls (15s each) and
+            // two websocket connect/bind phases (10s + 10s each). The budget
+            // leaves room for overhead without letting one attempt monopolize
+            // an identity indefinitely.
+            attempt_timeout: Duration::from_secs(90),
+            // Three attempts plus bounded backoff; longer than one full setup.
+            total_timeout: Duration::from_secs(300),
+        }
+    }
 }
 
 pub(crate) struct ConnectionManager {
     // The global map lock is never held over socket I/O; each identity has its
     // own transport lock; one reader task dispatches correlated responses.
     connections: Arc<Mutex<HashMap<IdentityKey, Arc<Connection>>>>,
+    reconnect: ReconnectPolicy,
     capacity: usize,
     idle_timeout: Duration,
     reaper_started: AtomicBool,
@@ -77,20 +109,138 @@ impl Default for ConnectionManager {
     }
 }
 
+async fn retry_connect<T, F, Fut, J>(
+    connect: &mut F,
+    policy: ReconnectPolicy,
+    mut jitter: J,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+    J: FnMut(Duration) -> Duration,
+{
+    let deadline = tokio::time::Instant::now() + policy.total_timeout;
+    let mut delay = policy.initial_delay;
+    let mut last_error = None;
+    for attempt in 0..policy.attempts {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match timeout(remaining.min(policy.attempt_timeout), connect()).await {
+            Ok(Ok(value)) => return Ok(value),
+            Ok(Err(error)) => {
+                if is_terminal_connect_error(&error) {
+                    return Err(error);
+                }
+                last_error = Some(error);
+            }
+            Err(_) => {
+                let error = if let Some(previous) = last_error.take() {
+                    anyhow!(
+                        "Timed out establishing authenticated Foundry websocket after {:?}; previous attempt failed: {previous}",
+                        policy.attempt_timeout
+                    )
+                } else {
+                    anyhow!(
+                        "Timed out establishing authenticated Foundry websocket after {:?}",
+                        policy.attempt_timeout
+                    )
+                };
+                if remaining <= policy.attempt_timeout {
+                    return Err(error);
+                }
+                last_error = Some(error);
+            }
+        }
+        if attempt + 1 < policy.attempts {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let jitter = jitter(policy.max_jitter);
+            tokio::time::sleep((delay + jitter.min(policy.max_jitter)).min(remaining)).await;
+            delay = delay.saturating_mul(2).min(policy.max_delay);
+        }
+    }
+    if tokio::time::Instant::now() >= deadline {
+        return Err(match last_error {
+            Some(error) => {
+                anyhow!("Aggregate Foundry reconnect deadline expired; last error: {error}")
+            }
+            None => anyhow!("Timed out establishing authenticated Foundry websocket"),
+        });
+    }
+    Err(last_error
+        .unwrap_or_else(|| anyhow!("Timed out establishing authenticated Foundry websocket")))
+}
+
+async fn connect_transport<F, Fut>(
+    connection: &Connection,
+    connect: &mut F,
+    policy: ReconnectPolicy,
+) -> Result<Transport>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Socket>>,
+{
+    let socket = retry_connect(connect, policy, |max| {
+        let jitter_limit = max.as_millis().min(u64::MAX as u128) as u64;
+        if jitter_limit == 0 {
+            Duration::ZERO
+        } else {
+            Duration::from_millis(rand::thread_rng().next_u64() % (jitter_limit + 1))
+        }
+    })
+    .await?;
+    let epoch = connection.next_epoch.fetch_add(1, Ordering::AcqRel);
+    connection.epoch.store(epoch, Ordering::Release);
+    Ok(Transport::start(socket, connection.epoch.clone(), epoch))
+}
+
+#[derive(Debug)]
+pub(crate) struct TerminalConnectError(String);
+
+impl std::fmt::Display for TerminalConnectError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for TerminalConnectError {}
+
+pub(crate) fn mark_terminal(error: anyhow::Error) -> anyhow::Error {
+    let message = error.to_string();
+    error.context(TerminalConnectError(message))
+}
+
+fn is_terminal_connect_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<TerminalConnectError>().is_some()
+}
+
+fn invalidate_epoch(active: &std::sync::atomic::AtomicU64, epoch: u64) {
+    let _ = active.compare_exchange(epoch, 0, Ordering::AcqRel, Ordering::Acquire);
+}
+
 fn monotonic_millis() -> u64 {
     static START: OnceLock<Instant> = OnceLock::new();
     START.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
-struct InFlight<'a>(&'a AtomicBool, &'a std::sync::atomic::AtomicU64, bool);
+struct InFlight<'a>(
+    &'a std::sync::atomic::AtomicU64,
+    u64,
+    &'a std::sync::atomic::AtomicU64,
+    bool,
+);
 
 impl Drop for InFlight<'_> {
     fn drop(&mut self) {
-        if self.2 {
-            // Cancellation can happen after send. Force the next caller to
-            // discard this stream rather than consume an uncorrelated late 430.
-            self.0.store(true, Ordering::Release);
-            self.1.store(monotonic_millis(), Ordering::Relaxed);
+        if self.3 {
+            // Cancellation can happen after send. Invalidate only this socket,
+            // never a successor installed by a later request.
+            invalidate_epoch(self.0, self.1);
+            self.2.store(monotonic_millis(), Ordering::Relaxed);
         }
     }
 }
@@ -99,6 +249,7 @@ impl ConnectionManager {
     fn with_limits(capacity: usize, idle_timeout: Duration) -> Self {
         Self {
             connections: Arc::new(Mutex::new(HashMap::new())),
+            reconnect: ReconnectPolicy::default(),
             capacity: capacity.max(1),
             idle_timeout,
             reaper_started: AtomicBool::new(false),
@@ -149,28 +300,33 @@ impl ConnectionManager {
         }
         let connection = Arc::new(Connection {
             transport: Mutex::new(None),
-            invalid: Arc::new(AtomicBool::new(false)),
+            world_gate: Mutex::new(()),
+            epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            next_epoch: std::sync::atomic::AtomicU64::new(1),
             last_used: std::sync::atomic::AtomicU64::new(monotonic_millis()),
         });
         connections.insert(key, connection.clone());
         Ok(connection)
     }
 
-    pub(crate) async fn world<F, Fut>(&self, key: IdentityKey, connect: F) -> Result<Value>
+    pub(crate) async fn world<F, Fut>(&self, key: IdentityKey, mut connect: F) -> Result<Value>
     where
-        F: FnOnce() -> Fut,
+        F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<Socket>>,
     {
         let connection = self.reserve(key).await?;
+        let _world_guard = timeout(crate::RESPONSE_TIMEOUT, connection.world_gate.lock())
+            .await
+            .map_err(|_| anyhow!("Timed out waiting for Foundry world request capacity"))?;
         let mut slot = connection.transport.lock().await;
-        if connection.invalid.swap(false, Ordering::AcqRel) {
+        if slot
+            .as_ref()
+            .is_some_and(|transport| connection.epoch.load(Ordering::Acquire) != transport.epoch)
+        {
             slot.take();
         }
         if slot.is_none() {
-            *slot = Some(Transport::start(
-                connect().await?,
-                connection.invalid.clone(),
-            ));
+            *slot = Some(connect_transport(&connection, &mut connect, self.reconnect).await?);
         }
         let (pending, frame) = match slot
             .as_ref()
@@ -179,14 +335,16 @@ impl ConnectionManager {
             .begin(crate::socket_mux::Request::World)
         {
             Ok(request) => request,
-            Err(error) => {
-                slot.take();
-                return Err(anyhow!(error));
-            }
+            Err(error) => return Err(anyhow!(error)),
         };
         let transport = slot.as_ref().unwrap().clone();
         drop(slot);
-        let mut in_flight = InFlight(&connection.invalid, &connection.last_used, true);
+        let mut in_flight = InFlight(
+            &connection.epoch,
+            transport.epoch,
+            &connection.last_used,
+            true,
+        );
         let write = if transport.mux.mark_sent(pending.id()) {
             transport.write(Message::Text(frame.into())).await
         } else {
@@ -196,8 +354,8 @@ impl ConnectionManager {
         };
         if let Err(error) = write {
             transport.mux.disconnect();
-            connection.invalid.store(true, Ordering::Release);
-            in_flight.2 = false;
+            invalidate_epoch(&connection.epoch, transport.epoch);
+            in_flight.3 = false;
             return Err(anyhow!("Failed writing Foundry world request: {error}"));
         }
         match timeout(crate::RESPONSE_TIMEOUT, pending.wait()).await {
@@ -205,19 +363,19 @@ impl ConnectionManager {
                 connection
                     .last_used
                     .store(monotonic_millis(), Ordering::Relaxed);
-                in_flight.2 = false;
+                in_flight.3 = false;
                 Ok(value)
             }
             Ok(Err(error)) => {
                 transport.mux.disconnect();
-                connection.invalid.store(true, Ordering::Release);
-                in_flight.2 = false;
+                invalidate_epoch(&connection.epoch, transport.epoch);
+                in_flight.3 = false;
                 Err(anyhow!(error))
             }
             Err(_) => {
                 transport.mux.disconnect();
-                connection.invalid.store(true, Ordering::Release);
-                in_flight.2 = false;
+                invalidate_epoch(&connection.epoch, transport.epoch);
+                in_flight.3 = false;
                 Err(anyhow!("Timed out waiting for Foundry world response"))
             }
         }
@@ -228,22 +386,22 @@ impl ConnectionManager {
         key: IdentityKey,
         document: String,
         operation: Value,
-        connect: F,
+        mut connect: F,
     ) -> Result<Value>
     where
-        F: FnOnce() -> Fut,
+        F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<Socket>>,
     {
         let connection = self.reserve(key).await?;
         let mut slot = connection.transport.lock().await;
-        if connection.invalid.swap(false, Ordering::AcqRel) {
+        if slot
+            .as_ref()
+            .is_some_and(|transport| connection.epoch.load(Ordering::Acquire) != transport.epoch)
+        {
             slot.take();
         }
         if slot.is_none() {
-            *slot = Some(Transport::start(
-                connect().await?,
-                connection.invalid.clone(),
-            ));
+            *slot = Some(connect_transport(&connection, &mut connect, self.reconnect).await?);
         }
         let (pending, frame) =
             match slot
@@ -256,14 +414,16 @@ impl ConnectionManager {
                     operation,
                 }) {
                 Ok(request) => request,
-                Err(error) => {
-                    slot.take();
-                    return Err(anyhow!(error));
-                }
+                Err(error) => return Err(anyhow!(error)),
             };
         let transport = slot.as_ref().unwrap().clone();
         drop(slot);
-        let mut in_flight = InFlight(&connection.invalid, &connection.last_used, true);
+        let mut in_flight = InFlight(
+            &connection.epoch,
+            transport.epoch,
+            &connection.last_used,
+            true,
+        );
         let write = if transport.mux.mark_sent(pending.id()) {
             transport.write(Message::Text(frame.into())).await
         } else {
@@ -273,8 +433,8 @@ impl ConnectionManager {
         };
         if let Err(error) = write {
             transport.mux.disconnect();
-            connection.invalid.store(true, Ordering::Release);
-            in_flight.2 = false;
+            invalidate_epoch(&connection.epoch, transport.epoch);
+            in_flight.3 = false;
             return Err(anyhow!("Failed writing Foundry document request: {error}"));
         }
         match timeout(crate::RESPONSE_TIMEOUT, pending.wait()).await {
@@ -287,19 +447,19 @@ impl ConnectionManager {
                 connection
                     .last_used
                     .store(monotonic_millis(), Ordering::Relaxed);
-                in_flight.2 = false;
+                in_flight.3 = false;
                 result
             }
             Ok(Err(error)) => {
                 transport.mux.disconnect();
-                connection.invalid.store(true, Ordering::Release);
-                in_flight.2 = false;
+                invalidate_epoch(&connection.epoch, transport.epoch);
+                in_flight.3 = false;
                 Err(anyhow!(error))
             }
             Err(_) => {
                 transport.mux.disconnect();
-                connection.invalid.store(true, Ordering::Release);
-                in_flight.2 = false;
+                invalidate_epoch(&connection.epoch, transport.epoch);
+                in_flight.3 = false;
                 Err(anyhow!("Timed out waiting for Foundry document response"))
             }
         }
@@ -307,10 +467,11 @@ impl ConnectionManager {
 }
 
 impl Transport {
-    fn start(socket: Socket, invalid: Arc<AtomicBool>) -> Self {
+    fn start(socket: Socket, active_epoch: Arc<std::sync::atomic::AtomicU64>, epoch: u64) -> Self {
         let (sender, mut receiver) = mpsc::channel::<Outbound>(64);
         let mux = crate::socket_mux::SocketMux::new(128, 64);
         let reader_mux = mux.clone();
+        let reader_epoch = active_epoch.clone();
         tokio::spawn(async move {
             let (mut sink, mut stream) = socket.split();
             loop {
@@ -334,7 +495,7 @@ impl Transport {
                                 let pong = timeout(crate::WRITE_TIMEOUT, sink.send(Message::Text(pong.into()))).await;
                                 if !matches!(pong, Ok(Ok(()))) { break; }
                             } else if reader_mux.receive(text.as_str()) {
-                                invalid.store(true, Ordering::Release);
+                                invalidate_epoch(&reader_epoch, epoch);
                                 break;
                             }
                         }
@@ -343,10 +504,10 @@ impl Transport {
                     }
                 }
             }
-            invalid.store(true, Ordering::Release);
+            invalidate_epoch(&reader_epoch, epoch);
             reader_mux.disconnect();
         });
-        Self { sender, mux }
+        Self { sender, mux, epoch }
     }
 
     async fn write(&self, message: Message) -> Result<()> {
@@ -426,10 +587,182 @@ fn safely_idle(connection: &Arc<Connection>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{enqueue_with_deadline, ConnectionManager, IdentityKey, Outbound};
-    use std::time::Duration;
+    use super::{
+        enqueue_with_deadline, invalidate_epoch, ConnectionManager, IdentityKey, Outbound,
+    };
+    use std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
     use tokio::sync::{mpsc, oneshot};
     use tokio_tungstenite::tungstenite::protocol::Message;
+
+    #[tokio::test]
+    async fn stale_reader_cannot_invalidate_an_installed_successor() {
+        let active_epoch = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let stale_reader_epoch = active_epoch.clone();
+        let (frame_seen, stale_frame) = tokio::sync::oneshot::channel();
+        let stale_reader = tokio::spawn(async move {
+            stale_frame.await.unwrap();
+            invalidate_epoch(&stale_reader_epoch, 1);
+        });
+
+        active_epoch.store(2, Ordering::Release);
+        frame_seen.send(()).unwrap();
+        stale_reader.await.unwrap();
+
+        assert_eq!(active_epoch.load(Ordering::Acquire), 2);
+        invalidate_epoch(&active_epoch, 2);
+        assert_eq!(active_epoch.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_connect_error_is_attempted_once() {
+        let policy = super::ReconnectPolicy {
+            attempts: 3,
+            initial_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            max_jitter: Duration::ZERO,
+            attempt_timeout: Duration::from_secs(1),
+            total_timeout: Duration::from_secs(1),
+        };
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = attempts.clone();
+        let mut connect = || {
+            observed.fetch_add(1, Ordering::Relaxed);
+            async {
+                Err(super::mark_terminal(anyhow::anyhow!(
+                    "Foundry authentication failed"
+                )))
+            }
+        };
+        let result: std::result::Result<(), anyhow::Error> =
+            super::retry_connect(&mut connect, policy, |_| Duration::ZERO).await;
+
+        assert_eq!(
+            result.err().unwrap().to_string(),
+            "Foundry authentication failed"
+        );
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_recovers_after_transient_failure() {
+        let policy = super::ReconnectPolicy {
+            attempts: 3,
+            initial_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(2),
+            max_jitter: Duration::ZERO,
+            attempt_timeout: Duration::from_secs(2),
+            total_timeout: Duration::from_secs(5),
+        };
+        let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = attempts.clone();
+        let mut connect = || {
+            let attempt = observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            async move {
+                if attempt == 0 {
+                    Err(anyhow::anyhow!("transient connect failure"))
+                } else {
+                    Ok(attempt)
+                }
+            }
+        };
+        let started = tokio::time::Instant::now();
+        let result: std::result::Result<usize, anyhow::Error> =
+            super::retry_connect(&mut connect, policy, |_| Duration::ZERO).await;
+        assert_eq!(result.unwrap(), 1);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_successful_attempt_can_finish_within_its_budget() {
+        let policy = super::ReconnectPolicy {
+            attempts: 3,
+            initial_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(2),
+            max_jitter: Duration::ZERO,
+            attempt_timeout: Duration::from_secs(5),
+            total_timeout: Duration::from_secs(10),
+        };
+        let mut connect = || async {
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            Ok::<_, anyhow::Error>("connected")
+        };
+        let started = tokio::time::Instant::now();
+        let result = super::retry_connect(&mut connect, policy, |_| Duration::ZERO).await;
+
+        assert_eq!(result.unwrap(), "connected");
+        assert_eq!(started.elapsed(), Duration::from_secs(4));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn attempt_timeout_allows_retry_before_total_deadline() {
+        let policy = super::ReconnectPolicy {
+            attempts: 3,
+            initial_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(2),
+            max_jitter: Duration::ZERO,
+            attempt_timeout: Duration::from_secs(2),
+            total_timeout: Duration::from_secs(7),
+        };
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = attempts.clone();
+        let mut connect = || {
+            let attempt = observed.fetch_add(1, Ordering::Relaxed);
+            async move {
+                if attempt == 0 {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    Err(anyhow::anyhow!("slow transient failure"))
+                } else {
+                    Ok(attempt)
+                }
+            }
+        };
+        let started = tokio::time::Instant::now();
+        let result = super::retry_connect(&mut connect, policy, |_| Duration::ZERO).await;
+
+        assert_eq!(result.unwrap(), 1);
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(started.elapsed(), Duration::from_secs(3));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn reconnect_attempts_and_backoff_share_an_aggregate_deadline() {
+        let policy = super::ReconnectPolicy {
+            attempts: 5,
+            initial_delay: Duration::from_secs(1),
+            max_delay: Duration::from_secs(2),
+            max_jitter: Duration::ZERO,
+            attempt_timeout: Duration::from_secs(2),
+            total_timeout: Duration::from_millis(2500),
+        };
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = attempts.clone();
+        let started = tokio::time::Instant::now();
+        let mut connect = || {
+            observed.fetch_add(1, Ordering::Relaxed);
+            async { Err(anyhow::anyhow!("transient connect failure")) }
+        };
+        let result: std::result::Result<(), anyhow::Error> =
+            super::retry_connect(&mut connect, policy, |_| Duration::ZERO).await;
+
+        let error = result.err().unwrap().to_string();
+        assert!(
+            error.contains("Aggregate Foundry reconnect deadline expired"),
+            "{error}"
+        );
+        assert!(
+            error.contains("last error: transient connect failure"),
+            "{error}"
+        );
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert_eq!(started.elapsed(), Duration::from_millis(2500));
+    }
 
     #[test]
     fn credential_keys_are_stable_and_secret_sensitive() {

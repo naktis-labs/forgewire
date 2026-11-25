@@ -116,9 +116,31 @@ pub fn process_documents(
         })
         .map(|doc| project_document(doc, fields))
         .collect();
-    while max_length > 0 && !out.is_empty() && serde_json::to_vec(&out).unwrap().len() > max_length
-    {
-        out.pop();
+    if max_length > 0 && !out.is_empty() {
+        let element_lengths: Vec<_> = out
+            .iter()
+            .map(|value| serde_json::to_vec(value).unwrap().len())
+            .collect();
+        let mut serialized_length =
+            element_lengths
+                .iter()
+                .enumerate()
+                .fold(2usize, |length, (index, element)| {
+                    length
+                        .saturating_add(*element)
+                        .saturating_add(usize::from(index > 0))
+                });
+        let mut remaining = element_lengths.len();
+        while !out.is_empty() && serialized_length > max_length {
+            out.pop();
+            remaining -= 1;
+            if remaining == 0 {
+                serialized_length = 2;
+            } else {
+                serialized_length =
+                    serialized_length.saturating_sub(element_lengths[remaining].saturating_add(1));
+            }
+        }
     }
     out
 }
@@ -226,6 +248,60 @@ mod tests {
         );
         assert!(process_documents(&docs, Some(&f), None, 1).is_empty());
     }
+    #[test]
+    fn byte_limit_uses_exact_array_json_bytes_and_keeps_float_fidelity() {
+        let docs = vec![
+            json!({"text":"é\\n\\\"","value":1.0}),
+            json!({"text":"🙂","value":-0.0}),
+        ];
+        let serialized = serde_json::to_vec(&docs).unwrap();
+        assert_eq!(process_documents(&docs, None, None, serialized.len()), docs);
+        let first = serde_json::to_vec(&docs[..1]).unwrap();
+        assert_eq!(process_documents(&docs, None, None, first.len()), docs[..1]);
+        assert_eq!(
+            process_documents(&docs, None, None, first.len() - 1),
+            Vec::<Value>::new()
+        );
+        assert_eq!(
+            serde_json::to_vec(&process_documents(&docs, None, None, 0)).unwrap(),
+            serialized
+        );
+    }
+
+    #[test]
+    fn byte_limit_matches_serialized_prefix_thresholds() {
+        let docs = vec![
+            json!({"s":"é\\n","f":1.0}),
+            json!({"s":"🙂","f":-0.0}),
+            json!({"s":"quote: \\\"","f":1e-200}),
+        ];
+        let full_len = serde_json::to_vec(&docs).unwrap().len();
+        for max_length in 0..=full_len + 1 {
+            let mut expected = docs.clone();
+            while max_length > 0
+                && !expected.is_empty()
+                && serde_json::to_vec(&expected).unwrap().len() > max_length
+            {
+                expected.pop();
+            }
+            assert_eq!(
+                process_documents(&docs, None, None, max_length),
+                expected,
+                "max_length={max_length}"
+            );
+        }
+    }
+
+    #[test]
+    fn byte_limit_preserves_empty_array_and_tiny_limit_behavior() {
+        assert!(process_documents(&[], None, None, 1).is_empty());
+        assert!(process_documents(&[json!(1)], None, None, 1).is_empty());
+        assert_eq!(
+            serde_json::to_vec(&process_documents(&[], None, None, 1)).unwrap(),
+            b"[]"
+        );
+    }
+
     #[test]
     fn numeric_filters_use_javascript_number_equality() {
         let docs = vec![
