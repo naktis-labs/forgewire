@@ -6,8 +6,8 @@ use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::protocol::Message;
 
 use crate::{
-    socket_request, wait_for_session, FoundryClient, FoundryCredential, RESPONSE_TIMEOUT,
-    SESSION_TIMEOUT, SOCKET_CONNECT_TIMEOUT,
+    wait_for_session, FoundryClient, FoundryCredential, RESPONSE_TIMEOUT, SESSION_TIMEOUT,
+    SOCKET_CONNECT_TIMEOUT,
 };
 
 pub const MAX_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
@@ -133,7 +133,7 @@ impl FoundryClient {
         extensions: Option<&[String]>,
     ) -> Result<Value> {
         let (session, generation, userid) = self.session(credential).await?;
-        let request = socket_request(&credential.hostname, &session, generation)?;
+        let request = self.socket_request(&credential.hostname, &session, generation)?;
         let mut socket = timeout(SOCKET_CONNECT_TIMEOUT, crate::connect_socket(request))
             .await
             .map_err(|_| anyhow!("Foundry websocket connection timed out"))?

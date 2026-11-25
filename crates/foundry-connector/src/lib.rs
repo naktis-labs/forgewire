@@ -21,6 +21,14 @@ pub mod files;
 pub mod read_ops;
 pub mod socket_mux;
 
+/// The disposable local Foundry world used by the interoperability harness.
+///
+/// It is compiled for this crate's own tests and for builds that enable the
+/// `loopback-interop` feature, so the interoperability tests in the server
+/// crate drive the same fake world the connector's tests use.
+#[cfg(any(test, feature = "loopback-interop"))]
+pub mod interop;
+
 #[derive(Clone, Deserialize)]
 pub struct FoundryCredential {
     pub id: Option<String>,
@@ -95,8 +103,10 @@ where
 pub struct FoundryClient {
     http: reqwest::Client,
     connections: std::sync::Arc<connection::ConnectionManager>,
-    #[cfg(test)]
-    test_base_url: Option<Url>,
+    /// The loopback world the harness points the client at. `None` for the
+    /// production client, which is HTTPS-only.
+    #[cfg(any(test, feature = "loopback-interop"))]
+    loopback_base_url: Option<Url>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -641,33 +651,70 @@ impl FoundryClient {
                 .timeout(HTTP_TIMEOUT)
                 .build()?,
             connections: std::sync::Arc::new(connection::ConnectionManager::default()),
-            #[cfg(test)]
-            test_base_url: None,
+            #[cfg(any(test, feature = "loopback-interop"))]
+            loopback_base_url: None,
+        })
+    }
+
+    /// Build a client for a disposable loopback Foundry world.
+    ///
+    /// The production client is HTTPS-only (`https_only(true)`, `wss://`), so
+    /// it cannot reach a local world that speaks plaintext HTTP and
+    /// WebSocket. This constructor exists for the interoperability harness
+    /// and is refused for anything but a loopback address, so a harness
+    /// client can never be pointed at a live Foundry host. It is compiled
+    /// only for this crate's own tests and for builds that enable the
+    /// `loopback-interop` feature.
+    #[cfg(any(test, feature = "loopback-interop"))]
+    pub fn for_loopback(base_url: &str) -> Result<Self> {
+        let base_url = Url::parse(base_url)?;
+        if base_url.scheme() != "http" || base_url.host_str() != Some("127.0.0.1") {
+            bail!("loopback transport must use loopback HTTP");
+        }
+        Ok(Self {
+            http: reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(HTTP_TIMEOUT)
+                .build()?,
+            connections: std::sync::Arc::new(connection::ConnectionManager::default()),
+            loopback_base_url: Some(base_url),
         })
     }
 
     #[cfg(test)]
     fn for_test(base_url: &str) -> Result<Self> {
-        let base_url = Url::parse(base_url)?;
-        if base_url.scheme() != "http" || base_url.host_str() != Some("127.0.0.1") {
-            bail!("test transport must use loopback HTTP");
-        }
-        Ok(Self {
-            http: reqwest::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(HTTP_TIMEOUT)
-                .build()?,
-            connections: std::sync::Arc::new(connection::ConnectionManager::default()),
-            test_base_url: Some(base_url),
-        })
+        Self::for_loopback(base_url)
     }
 
     fn url_for(&self, host: &str, path: &str) -> Result<Url> {
-        #[cfg(test)]
-        if let Some(base) = &self.test_base_url {
+        #[cfg(any(test, feature = "loopback-interop"))]
+        if let Some(base) = &self.loopback_base_url {
             return Ok(base.join(path.trim_start_matches('/'))?);
         }
         Self::host_url(host, path)
+    }
+
+    /// The websocket request for one session.
+    ///
+    /// The loopback world the harness points the client at is reached over
+    /// plaintext `ws://`; every other target keeps the production `wss://`
+    /// form. Both paths share the version-specific session binding.
+    fn socket_request(
+        &self,
+        host: &str,
+        session: &str,
+        generation: Option<u64>,
+    ) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request> {
+        #[cfg(any(test, feature = "loopback-interop"))]
+        if let Some(base) = &self.loopback_base_url {
+            return socket_request_for_url(
+                base.join("socket.io/?EIO=4&transport=websocket")?,
+                session,
+                generation,
+            );
+        }
+        socket_request(host, session, generation)
     }
 
     fn host_url(host: &str, path: &str) -> Result<Url> {
@@ -801,22 +848,7 @@ impl FoundryClient {
         session: &str,
         generation: Option<u64>,
     ) -> Result<Option<Vec<Value>>> {
-        let request = {
-            #[cfg(test)]
-            if let Some(base) = &self.test_base_url {
-                socket_request_for_url(
-                    base.join("socket.io/?EIO=4&transport=websocket")?,
-                    session,
-                    generation,
-                )?
-            } else {
-                socket_request(host, session, generation)?
-            }
-            #[cfg(not(test))]
-            {
-                socket_request(host, session, generation)?
-            }
-        };
+        let request = self.socket_request(host, session, generation)?;
         let mut socket = match timeout(SOCKET_CONNECT_TIMEOUT, connect_socket(request)).await {
             Ok(Ok(socket)) => socket,
             Ok(Err(_)) | Err(_) => return Ok(None),
@@ -899,18 +931,8 @@ impl FoundryClient {
                 .connections
                 .world(key, || async {
                     let (session, generation, userid) = self.session(credential).await?;
-                    #[cfg(test)]
-                    let request = if let Some(base) = &self.test_base_url {
-                        socket_request_for_url(
-                            base.join("socket.io/?EIO=4&transport=websocket")?,
-                            &session,
-                            generation,
-                        )?
-                    } else {
-                        socket_request(&credential.hostname, &session, generation)?
-                    };
-                    #[cfg(not(test))]
-                    let request = socket_request(&credential.hostname, &session, generation)?;
+                    let request =
+                        self.socket_request(&credential.hostname, &session, generation)?;
                     let mut socket = timeout(SOCKET_CONNECT_TIMEOUT, connect_socket(request))
                         .await
                         .map_err(|_| anyhow!("Foundry websocket connection timed out"))?
@@ -937,18 +959,8 @@ impl FoundryClient {
                 .connections
                 .document_get(key, document.to_owned(), operation, || async {
                     let (session, generation, userid) = self.session(credential).await?;
-                    #[cfg(test)]
-                    let request = if let Some(base) = &self.test_base_url {
-                        socket_request_for_url(
-                            base.join("socket.io/?EIO=4&transport=websocket")?,
-                            &session,
-                            generation,
-                        )?
-                    } else {
-                        socket_request(&credential.hostname, &session, generation)?
-                    };
-                    #[cfg(not(test))]
-                    let request = socket_request(&credential.hostname, &session, generation)?;
+                    let request =
+                        self.socket_request(&credential.hostname, &session, generation)?;
                     let mut socket = timeout(SOCKET_CONNECT_TIMEOUT, connect_socket(request))
                         .await
                         .map_err(|_| anyhow!("Foundry websocket connection timed out"))?
@@ -964,18 +976,7 @@ impl FoundryClient {
                 .await;
         }
         let (session, generation, userid) = self.session(credential).await?;
-        #[cfg(test)]
-        let request = if let Some(base) = &self.test_base_url {
-            socket_request_for_url(
-                base.join("socket.io/?EIO=4&transport=websocket")?,
-                &session,
-                generation,
-            )?
-        } else {
-            socket_request(&credential.hostname, &session, generation)?
-        };
-        #[cfg(not(test))]
-        let request = socket_request(&credential.hostname, &session, generation)?;
+        let request = self.socket_request(&credential.hostname, &session, generation)?;
         let mut socket = timeout(SOCKET_CONNECT_TIMEOUT, connect_socket(request))
             .await
             .map_err(|_| anyhow!("Foundry websocket connection timed out"))?

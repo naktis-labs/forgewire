@@ -283,7 +283,9 @@ fn image_is_built_in_multiple_digest_pinned_stages() {
         .unwrap_or_default();
     assert!(
         version.split('.').count() >= 3
-            && version.split('.').all(|part| part.chars().all(|c| c.is_ascii_digit())),
+            && version
+                .split('.')
+                .all(|part| part.chars().all(|c| c.is_ascii_digit())),
         "the Rust toolchain must be pinned to an exact version, found {version}"
     );
 }
@@ -334,8 +336,8 @@ fn final_stage_runs_as_a_non_root_numeric_user() {
     );
     let user = users[0];
     assert!(
-        user.split(':').all(|part| !part.is_empty()
-            && part.chars().all(|c| c.is_ascii_digit())),
+        user.split(':')
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit())),
         "the run user must be a numeric UID[:GID] with no shell, found {user}"
     );
     let uid: u32 = user
@@ -383,7 +385,11 @@ fn runtime_listens_on_loopback_only() {
         .filter(|i| i.keyword == "ENTRYPOINT")
         .map(|i| i.argument.as_str())
         .collect();
-    assert_eq!(entrypoints.len(), 1, "the runtime stage needs one ENTRYPOINT");
+    assert_eq!(
+        entrypoints.len(),
+        1,
+        "the runtime stage needs one ENTRYPOINT"
+    );
     assert!(
         entrypoints[0].starts_with('['),
         "ENTRYPOINT must use exec form, found {}",
@@ -489,7 +495,8 @@ fn bearer_token_and_foundry_instance_are_supplied_at_run_time() {
         if instruction.keyword != "COPY" {
             continue;
         }
-        let source = copy_sources(&instruction.argument);        for path in source {
+        let source = copy_sources(&instruction.argument);
+        for path in source {
             assert!(
                 !path.contains("credentials"),
                 "the credentials file must never be copied into the image: {path}"

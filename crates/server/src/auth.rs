@@ -46,7 +46,9 @@ impl Scope {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'~' | b'+' | b'/'))
         {
-            anyhow::bail!("instance scope must consist of letters, digits, '-', '_', '~', '+' or '/'");
+            anyhow::bail!(
+                "instance scope must consist of letters, digits, '-', '_', '~', '+' or '/'"
+            );
         }
         Ok(Self(value.to_owned()))
     }
@@ -92,8 +94,7 @@ impl ScopedToken {
         };
         // The scope is an identifier, not a secret: it is compared as a
         // string. The secret is compared in constant time.
-        scope == self.scope.as_str()
-            && bool::from(secret.as_bytes().ct_eq(self.secret.as_bytes()))
+        scope == self.scope.as_str() && bool::from(secret.as_bytes().ct_eq(self.secret.as_bytes()))
     }
 }
 

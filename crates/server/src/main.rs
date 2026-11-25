@@ -26,6 +26,9 @@ mod contract_tests;
 #[cfg(test)]
 mod packaging_tests;
 
+#[cfg(test)]
+mod interop_tests;
+
 #[derive(Clone)]
 struct App {
     client: Arc<dyn operations::Connector>,
@@ -756,11 +759,8 @@ mod tests {
     /// The fixture token: issued for the scope of the test app's only
     /// instance, with the fixture secret.
     fn fixture_token() -> auth::ScopedToken {
-        auth::ScopedToken::new(
-            auth::Scope::new("one").unwrap(),
-            "fixture-token".to_owned(),
-        )
-        .unwrap()
+        auth::ScopedToken::new(auth::Scope::new("one").unwrap(), "fixture-token".to_owned())
+            .unwrap()
     }
 
     async fn post(body: Value, version: Option<&str>) -> (StatusCode, Value) {
@@ -949,7 +949,9 @@ mod tests {
 
         // An unknown scope, a scope without a token, and an invalid secret
         // all prevent startup.
-        assert!(configured_token(&instances, Some("secret".into()), Some("missing".into())).is_err());
+        assert!(
+            configured_token(&instances, Some("secret".into()), Some("missing".into())).is_err()
+        );
         assert!(configured_token(&instances, None, Some("one".into())).is_err());
         assert!(configured_token(&instances, Some("bad secret".into()), None).is_err());
 

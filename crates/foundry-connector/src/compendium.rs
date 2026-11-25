@@ -62,7 +62,7 @@ impl FoundryClient {
         data: Value,
     ) -> Result<Value> {
         let (session, generation, userid) = self.session(credential).await?;
-        let request = crate::socket_request(&credential.hostname, &session, generation)?;
+        let request = self.socket_request(&credential.hostname, &session, generation)?;
         let mut socket = timeout(
             crate::SOCKET_CONNECT_TIMEOUT,
             crate::connect_socket(request),

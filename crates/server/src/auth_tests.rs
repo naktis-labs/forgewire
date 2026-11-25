@@ -188,10 +188,7 @@ fn token_for(scope: &str) -> auth::ScopedToken {
 
 /// An app with two configured instances ("one" and "two") and, optionally,
 /// a token issued for one of their scopes.
-fn app(
-    token: Option<auth::ScopedToken>,
-    allow_writes: bool,
-) -> (Router, Arc<RecordingConnector>) {
+fn app(token: Option<auth::ScopedToken>, allow_writes: bool) -> (Router, Arc<RecordingConnector>) {
     let connector = Arc::new(RecordingConnector::new());
     let instances = instances::Instances::new(vec![
         credential("one", "one.example"),
@@ -243,11 +240,7 @@ async fn rest(
 }
 
 /// An MCP request carrying `credential` (when given) as its bearer token.
-async fn mcp(
-    router: &Router,
-    body: Value,
-    credential: Option<&str>,
-) -> (StatusCode, Value) {
+async fn mcp(router: &Router, body: Value, credential: Option<&str>) -> (StatusCode, Value) {
     let mut request = Request::post("/mcp")
         .header("host", "localhost")
         .header("content-type", "application/json");
@@ -284,7 +277,11 @@ async fn unauthenticated_requests_are_refused() {
     ] {
         let (status, body) = rest(&router, method, path, None, None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{method} {path}");
-        assert_eq!(body, Value::Null, "{method} {path} must not disclose content");
+        assert_eq!(
+            body,
+            Value::Null,
+            "{method} {path} must not disclose content"
+        );
     }
 
     // The MCP entry point is refused the same way: no session is issued and
@@ -367,7 +364,10 @@ async fn a_credential_for_the_configured_scope_is_accepted() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(response["result"]["isError"], false);
-    assert_eq!(response["result"]["content"][0]["text"], "{\"title\":\"Test World\"}");
+    assert_eq!(
+        response["result"]["content"][0]["text"],
+        "{\"title\":\"Test World\"}"
+    );
 }
 
 /// The Host and Origin defences keep working unchanged next to the token:
@@ -378,7 +378,11 @@ async fn host_and_origin_defences_hold_with_a_valid_credential() {
     let (router, connector) = app(Some(token_for(SCOPE)), false);
     let credential = format!("{SCOPE}.{SECRET}");
 
-    for host in ["evil.example", "localhost.evil.example", "localhost@evil.example"] {
+    for host in [
+        "evil.example",
+        "localhost.evil.example",
+        "localhost@evil.example",
+    ] {
         let request = Request::get("/api/world")
             .header("host", host)
             .header("authorization", format!("Bearer {credential}"))
@@ -478,7 +482,10 @@ async fn writes_require_authentication_and_the_opt_in() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(connector.recorded(), vec!["create_document:Actor".to_owned()]);
+    assert_eq!(
+        connector.recorded(),
+        vec!["create_document:Actor".to_owned()]
+    );
 
     // No token configured: a write is refused even though the opt-in is on.
     let (router, connector) = app(None, true);

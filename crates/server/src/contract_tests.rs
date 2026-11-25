@@ -278,11 +278,7 @@ const FIXTURE_CREDENTIAL: &str = "one.fixture-token";
 
 /// The fixture token: issued for the scope of the first configured instance.
 fn fixture_token() -> auth::ScopedToken {
-    auth::ScopedToken::new(
-        auth::Scope::new("one").unwrap(),
-        "fixture-token".to_owned(),
-    )
-    .unwrap()
+    auth::ScopedToken::new(auth::Scope::new("one").unwrap(), "fixture-token".to_owned()).unwrap()
 }
 
 fn contract_app(allow_writes: bool) -> (Router, Arc<FakeConnector>) {
@@ -1236,8 +1232,7 @@ async fn mcp_selection_is_session_scoped_and_never_redirects_rest() {
 /// silently running against the stable default instance.
 #[tokio::test]
 async fn expired_sessions_are_refused_until_the_client_initializes_again() {
-    let (router, fake) =
-        contract_app_with_token_and_sessions(true, 1, Some(fixture_token()));
+    let (router, fake) = contract_app_with_token_and_sessions(true, 1, Some(fixture_token()));
 
     let session_a = mcp_initialize(&router).await;
     let (status, selected) = mcp_call_as(

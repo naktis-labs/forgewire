@@ -20,4 +20,5 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+foundry-connector = { path = "../foundry-connector", features = ["loopback-interop"] }
 tower = { version = "0.5", features = ["util"] }

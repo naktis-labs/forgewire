@@ -4,8 +4,18 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+# Interoperability harness support. It enables the disposable local Foundry
+# world (`interop`) and the loopback-only client constructor
+# (`FoundryClient::for_loopback`) the harness drives the real connector with.
+# The released server never enables it: the production client stays
+# HTTPS-only, and the harness client is refused for any non-loopback host.
+loopback-interop = ["dep:axum"]
+
 [dependencies]
 anyhow.workspace = true
+axum = { version = "0.8", features = ["ws"], optional = true }
 futures-util.workspace = true
 http.workspace = true
 rand.workspace = true
