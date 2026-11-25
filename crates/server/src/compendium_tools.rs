@@ -17,11 +17,11 @@ pub fn recognizes(name: &str) -> bool {
 pub async fn call(
     client: &dyn Connector,
     credential: &FoundryCredential,
-    allow_writes: bool,
+    policy: operations::WritePolicy,
     name: &str,
     args: &Value,
 ) -> anyhow::Result<Value> {
-    Ok(operations::compendium(client, credential, allow_writes, name, args).await?)
+    Ok(operations::compendium(client, credential, policy, name, args).await?)
 }
 
 #[cfg(test)]

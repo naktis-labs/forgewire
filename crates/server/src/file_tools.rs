@@ -17,13 +17,13 @@ pub fn recognizes(name: &str) -> bool {
 pub async fn call(
     client: &dyn Connector,
     credential: &FoundryCredential,
-    allow_writes: bool,
+    policy: operations::WritePolicy,
     name: &str,
     args: &Value,
 ) -> anyhow::Result<Value> {
     match name {
         "browse_files" => Ok(operations::browse_files(client, credential, args).await?),
-        "upload_file" => Ok(operations::upload_file(client, credential, allow_writes, args).await?),
+        "upload_file" => Ok(operations::upload_file(client, credential, policy, args).await?),
         _ => anyhow::bail!("unknown file tool"),
     }
 }

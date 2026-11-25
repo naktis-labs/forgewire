@@ -35,6 +35,42 @@ pub const WRITE_KINDS: [&str; 23] = [
 /// cannot drift apart on the safety wording.
 pub const WRITES_DISABLED: &str = "writes are disabled; set FOUNDRY_ALLOW_WRITES=true to enable";
 
+/// The single write-gating message for a request that carries no valid
+/// authentication. Writes are the one capability that always requires an
+/// authenticated caller, so the wording is shared exactly like
+/// [`WRITES_DISABLED`].
+pub const WRITES_REQUIRE_AUTHENTICATION: &str =
+    "writes require authentication; configure FORGEWIRE_BEARER_TOKEN and send Authorization: Bearer <scope>.<token>";
+
+/// The two independent gates every write must pass: the operator's explicit
+/// opt-in and the request's own authentication. Keeping them in one value
+/// stops the transports from passing them in the wrong order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WritePolicy {
+    /// `FOUNDRY_ALLOW_WRITES=true`.
+    pub allow_writes: bool,
+    /// The request presented a valid, in-scope bearer token.
+    pub authenticated: bool,
+}
+
+impl WritePolicy {
+    /// A policy for a request that is not authenticated.
+    pub fn unauthenticated(allow_writes: bool) -> Self {
+        Self {
+            allow_writes,
+            authenticated: false,
+        }
+    }
+
+    /// A policy for an authenticated request.
+    pub fn authenticated(allow_writes: bool) -> Self {
+        Self {
+            allow_writes,
+            authenticated: true,
+        }
+    }
+}
+
 const TYPES: [(&str, &str, &str, Option<&str>); 13] = [
     ("actor", "actors", "actors", Some("Actor")),
     ("item", "items", "items", Some("Item")),
@@ -547,12 +583,20 @@ impl std::error::Error for OperationError {
     }
 }
 
-fn ensure_writes_allowed(allow_writes: bool) -> Result<(), OperationError> {
-    if allow_writes {
-        Ok(())
-    } else {
-        Err(OperationError::Forbidden(anyhow!("{WRITES_DISABLED}")))
+/// The write gate shared by every mutating operation: the operator's opt-in
+/// first (the documented default is "disabled"), then the request's own
+/// authentication. A write is refused outright when either gate fails, so
+/// no mutating call ever reaches the connector.
+fn ensure_writes_allowed(policy: WritePolicy) -> Result<(), OperationError> {
+    if !policy.allow_writes {
+        return Err(OperationError::Forbidden(anyhow!("{WRITES_DISABLED}")));
     }
+    if !policy.authenticated {
+        return Err(OperationError::Forbidden(anyhow!(
+            "{WRITES_REQUIRE_AUTHENTICATION}"
+        )));
+    }
+    Ok(())
 }
 
 /// Classify a failure from the shared read path's connector call. An unknown
@@ -619,11 +663,11 @@ pub async fn execute_read(
 pub async fn write_document(
     client: &dyn Connector,
     target: &FoundryCredential,
-    allow_writes: bool,
+    policy: WritePolicy,
     operation: &str,
     args: &Value,
 ) -> Result<Value, OperationError> {
-    ensure_writes_allowed(allow_writes)?;
+    ensure_writes_allowed(policy)?;
     let (kind, id, parent, pack, data, ids) =
         write_arguments(args, operation).map_err(OperationError::Invalid)?;
     match operation {
@@ -658,14 +702,14 @@ fn required_string<'a>(args: &'a Map<String, Value>, key: &str) -> Result<&'a st
 pub async fn compendium(
     client: &dyn Connector,
     target: &FoundryCredential,
-    allow_writes: bool,
+    policy: WritePolicy,
     name: &str,
     args: &Value,
 ) -> Result<Value, OperationError> {
     let args = object_args(args).map_err(OperationError::Invalid)?;
     match name {
         "create_compendium" | "delete_compendium" => {
-            ensure_writes_allowed(allow_writes)?;
+            ensure_writes_allowed(policy)?;
             match name {
                 "create_compendium" => client
                     .create_compendium(
@@ -750,10 +794,10 @@ fn decode_upload(encoded: &str) -> Result<Vec<u8>> {
 pub async fn upload_file(
     client: &dyn Connector,
     target: &FoundryCredential,
-    allow_writes: bool,
+    policy: WritePolicy,
     args: &Value,
 ) -> Result<Value, OperationError> {
-    ensure_writes_allowed(allow_writes)?;
+    ensure_writes_allowed(policy)?;
     let args = object_args(args).map_err(OperationError::Invalid)?;
     match args.get("overwrite") {
         Some(Value::Bool(true)) => {}
@@ -892,10 +936,20 @@ mod tests {
 
     #[test]
     fn write_gating_is_typed_as_forbidden_with_the_shared_message() {
-        let error = ensure_writes_allowed(false).unwrap_err();
+        // The opt-in comes first: the documented default is "disabled".
+        let error = ensure_writes_allowed(WritePolicy::unauthenticated(false)).unwrap_err();
         assert!(matches!(error, OperationError::Forbidden(_)));
         assert_eq!(error.to_string(), WRITES_DISABLED);
-        assert!(ensure_writes_allowed(true).is_ok());
+        // The opt-in alone is not enough: a write also needs an
+        // authenticated request.
+        let error = ensure_writes_allowed(WritePolicy::unauthenticated(true)).unwrap_err();
+        assert!(matches!(error, OperationError::Forbidden(_)));
+        assert_eq!(error.to_string(), WRITES_REQUIRE_AUTHENTICATION);
+        // Both gates passed.
+        assert!(ensure_writes_allowed(WritePolicy::authenticated(true)).is_ok());
+        // An authenticated request is still gated by the opt-in.
+        let error = ensure_writes_allowed(WritePolicy::authenticated(false)).unwrap_err();
+        assert_eq!(error.to_string(), WRITES_DISABLED);
     }
 
     #[test]

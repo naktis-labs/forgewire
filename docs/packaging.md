@@ -107,7 +107,16 @@ export FORGEWIRE_BEARER_TOKEN="$(openssl rand -base64 32 | tr -d '/+=' | cut -c1
 (letters, digits, `-._~+/`, optionally followed by `=` padding). An invalid or
 empty value prevents startup. If the variable is unset the gateway starts
 without authentication — which is only acceptable because it listens on
-loopback.
+loopback, and because writes stay disabled without a token.
+
+The token is issued for one instance scope. Clients send
+`Authorization: Bearer <scope>.<token>`, where `<scope>` is the identifier
+of the configured Foundry instance the token belongs to (its `id`, or its
+zero-based `item_order` when it has no `id`). By default the scope is the
+stable default instance, the first configured entry; set
+`FORGEWIRE_BEARER_TOKEN_SCOPE` to another configured instance's `id` to
+issue the token for it. A credential issued for a different instance is
+refused even when its secret matches.
 
 A `--env-file` with mode `0600` works as well:
 
@@ -139,22 +148,25 @@ docker run --rm --network host \
 
 ```sh
 curl -sS -H "Host: localhost" http://127.0.0.1:8765/health
-curl -sS -H "Host: localhost" -H "Authorization: Bearer $FORGEWIRE_BEARER_TOKEN" \
+curl -sS -H "Host: localhost" -H "Authorization: Bearer one.$FORGEWIRE_BEARER_TOKEN" \
   http://127.0.0.1:8765/api/instances
 ```
 
 The `Host` header must name localhost or a loopback address; the gateway
 rejects other host names and rejects any request that carries an `Origin`
-header.
+header. The `one.` prefix in the example is the scope of the credential: it
+is the `id` of the instance the token was issued for (the first configured
+entry here). Without the correct scope the request is refused.
 
 ## The runtime contract
 
 | Variable | Default in the image | Meaning |
 | --- | --- | --- |
 | `BIND_ADDR` | `127.0.0.1:8765` | Listen address. Non-loopback addresses are rejected at startup. |
-| `FORGEWIRE_BEARER_TOKEN` | not set | When set, every route including `/health` and `/mcp` requires `Authorization: Bearer <token>`. Supply at run time. |
+| `FORGEWIRE_BEARER_TOKEN` | not set | When set, every route including `/health` and `/mcp` requires `Authorization: Bearer <scope>.<token>`. Supply at run time. |
+| `FORGEWIRE_BEARER_TOKEN_SCOPE` | the stable default instance (the first configured entry) | The configured instance the token is issued for. Writes always need an authenticated request, so a token is required for mutations. |
 | `FOUNDRY_CREDENTIALS` | `/etc/forgewire/foundry_credentials.json` | Path of the Foundry credentials file, mounted read-only. |
-| `FOUNDRY_ALLOW_WRITES` | not set | Set to `true` to enable document mutations. Disabled by default. |
+| `FOUNDRY_ALLOW_WRITES` | not set | Set to `true` to enable document mutations. Disabled by default, and mutations additionally require an authenticated request. |
 | `RUST_LOG` | `info` | Log filter. |
 
 **The runtime listens on reachable everywhere.** `BIND_ADDR` defaults to

@@ -13,12 +13,26 @@
 //! Both transports resolve the target once per request into an owned
 //! credential snapshot, so later selections never retarget in-flight work,
 //! and instance listing never discloses secrets (passwords or usernames).
+//!
+//! Every configured instance also has a canonical *scope* name — its `id`,
+//! or its zero-based `item_order` when it has no `id`. The scope is what a
+//! bearer token is issued for, so it names exactly one instance and is
+//! resolved through the same configured set.
 
 use foundry_connector::FoundryCredential;
 use rand::RngCore;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+
+/// The canonical scope identifier of one configured instance: its configured
+/// `id`, or its zero-based `item_order` when it has no `id`.
+fn canonical_scope(index: usize, credential: &FoundryCredential) -> String {
+    match credential.id.as_deref() {
+        Some(id) if !id.is_empty() => id.to_owned(),
+        _ => index.to_string(),
+    }
+}
 
 /// The configured instances. Resolution is pure: it returns indices and owned
 /// snapshots and stores nothing, so "selecting" an instance can never affect
@@ -49,6 +63,36 @@ impl Instances {
             .get(index)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("instance not found"))
+    }
+
+    /// The canonical scope identifier of the instance at `index`: its
+    /// configured `id`, or its zero-based `item_order` when it has no `id`.
+    /// This is the name a bearer token's scope refers to, so it must be
+    /// unique across the configured instances.
+    pub fn canonical_scope(&self, index: usize) -> anyhow::Result<String> {
+        let credential = self
+            .credentials
+            .get(index)
+            .ok_or_else(|| anyhow::anyhow!("instance not found"))?;
+        Ok(canonical_scope(index, credential))
+    }
+
+    /// Resolve a scope name to the instance it names. A scope names exactly
+    /// one configured instance: an unknown scope is an error, and a scope
+    /// shared by two instances is ambiguous rather than silently resolved.
+    pub fn resolve_scope(&self, scope: &str) -> anyhow::Result<usize> {
+        let mut matches = self
+            .credentials
+            .iter()
+            .enumerate()
+            .filter(|(index, credential)| canonical_scope(*index, credential) == scope);
+        if let Some((index, _)) = matches.next() {
+            if matches.next().is_some() {
+                anyhow::bail!("ambiguous instance scope");
+            }
+            return Ok(index);
+        }
+        anyhow::bail!("unknown instance scope")
     }
 
     /// Resolve a REST `?instance=` reference: a configured instance `id`

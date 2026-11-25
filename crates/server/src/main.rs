@@ -1,5 +1,5 @@
 use axum::{
-    extract::{DefaultBodyLimit, Path, Query, Request, State},
+    extract::{DefaultBodyLimit, Extension, Path, Query, Request, State},
     http::{header, HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -10,11 +10,15 @@ use foundry_connector::{FoundryClient, FoundryCredential};
 use serde_json::{json, Value};
 use std::{collections::HashMap, env, net::SocketAddr, sync::Arc};
 
+mod auth;
 mod compendium_tools;
 mod file_tools;
 mod instances;
 mod operations;
 mod read_tools;
+
+#[cfg(test)]
+mod auth_tests;
 
 #[cfg(test)]
 mod contract_tests;
@@ -28,6 +32,19 @@ struct App {
     instances: instances::Instances,
     selections: instances::Selections,
     allow_writes: bool,
+}
+
+impl App {
+    /// The write gate for one request: the operator's opt-in plus this
+    /// request's own authentication. Both transports build it the same way,
+    /// so a write is never reachable through one of them alone.
+    fn write_policy(&self, authentication: auth::Authentication) -> operations::WritePolicy {
+        if authentication.is_authenticated() {
+            operations::WritePolicy::authenticated(self.allow_writes)
+        } else {
+            operations::WritePolicy::unauthenticated(self.allow_writes)
+        }
+    }
 }
 
 /// Resolve a REST request's Foundry target: `?instance=<id|item_order>` when
@@ -143,6 +160,7 @@ async fn rest_compendium_documents(
 
 async fn rest_create_compendium(
     State(app): State<Arc<App>>,
+    Extension(authentication): Extension<auth::Authentication>,
     Query(query): Query<HashMap<String, String>>,
     Json(args): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -150,7 +168,7 @@ async fn rest_create_compendium(
     operations::compendium(
         &*app.client,
         &credential,
-        app.allow_writes,
+        app.write_policy(authentication),
         "create_compendium",
         &args,
     )
@@ -161,6 +179,7 @@ async fn rest_create_compendium(
 
 async fn rest_delete_compendium(
     State(app): State<Arc<App>>,
+    Extension(authentication): Extension<auth::Authentication>,
     Path(name): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -168,7 +187,7 @@ async fn rest_delete_compendium(
     operations::compendium(
         &*app.client,
         &credential,
-        app.allow_writes,
+        app.write_policy(authentication),
         "delete_compendium",
         &json!({"name":name}),
     )
@@ -218,18 +237,25 @@ async fn rest_browse_files(
 
 async fn rest_upload_file(
     State(app): State<Arc<App>>,
+    Extension(authentication): Extension<auth::Authentication>,
     Query(query): Query<HashMap<String, String>>,
     Json(args): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let credential = rest_target(&app.instances, &query)?;
-    operations::upload_file(&*app.client, &credential, app.allow_writes, &args)
-        .await
-        .map(Json)
-        .map_err(operation_status)
+    operations::upload_file(
+        &*app.client,
+        &credential,
+        app.write_policy(authentication),
+        &args,
+    )
+    .await
+    .map(Json)
+    .map_err(operation_status)
 }
 
 async fn rest_write(
     State(app): State<Arc<App>>,
+    Extension(authentication): Extension<auth::Authentication>,
     Path(operation): Path<String>,
     Query(query): Query<HashMap<String, String>>,
     Json(args): Json<Value>,
@@ -244,7 +270,7 @@ async fn rest_write(
     operations::write_document(
         &*app.client,
         &credential,
-        app.allow_writes,
+        app.write_policy(authentication),
         &operation,
         &args,
     )
@@ -253,53 +279,51 @@ async fn rest_write(
     .map_err(operation_status)
 }
 
-#[derive(Clone)]
-struct BearerToken(String);
-
-impl BearerToken {
-    fn parse(value: String) -> anyhow::Result<Self> {
-        // RFC 6750 b64token syntax, with padding allowed only at the end.
-        let token = value.trim_end_matches('=');
-        if token.is_empty()
-            || !token.bytes().all(|b| {
-                b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
-            })
-        {
-            anyhow::bail!("invalid FORGEWIRE_BEARER_TOKEN configuration");
-        }
-        Ok(Self(value))
-    }
-}
-
+/// Authenticate a request against the configured, instance-scoped token.
+///
+/// With no token configured the deployment keeps its local posture: reads
+/// stay open (the bind address, Host, and Origin checks still apply) and the
+/// request is marked unauthenticated, which is what the write gate refuses.
+///
+/// With a token configured, the request must present exactly one
+/// `Authorization: Bearer <scope>.<secret>` header whose scope and secret
+/// are the configured ones. A token issued for another instance is refused
+/// even when its secret matches. The decision is attached to the request so
+/// the shared application layer can require authentication for writes
+/// without either transport re-deriving it.
 async fn authenticate(
-    State(token): State<Option<BearerToken>>,
-    request: Request,
+    State(token): State<Option<auth::ScopedToken>>,
+    mut request: Request,
     next: Next,
 ) -> Response {
-    use subtle::ConstantTimeEq;
-    if let Some(token) = token {
-        let mut values = request.headers().get_all(header::AUTHORIZATION).iter();
-        let candidate = values
-            .next()
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| {
-                let (scheme, credential) = value.split_once(' ')?;
-                if scheme.eq_ignore_ascii_case("bearer") {
-                    Some(credential.as_bytes())
-                } else {
-                    None
-                }
-            });
-        if values.next().is_some()
-            || !candidate.is_some_and(|candidate| bool::from(candidate.ct_eq(token.0.as_bytes())))
-        {
-            return (
-                StatusCode::UNAUTHORIZED,
-                [(header::WWW_AUTHENTICATE, "Bearer")],
-            )
-                .into_response();
-        }
+    let Some(token) = token else {
+        request
+            .extensions_mut()
+            .insert(auth::Authentication::Unauthenticated);
+        return next.run(request).await;
+    };
+    let mut values = request.headers().get_all(header::AUTHORIZATION).iter();
+    let candidate = values
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            let (scheme, credential) = value.split_once(' ')?;
+            if scheme.eq_ignore_ascii_case("bearer") {
+                Some(credential)
+            } else {
+                None
+            }
+        });
+    if values.next().is_some() || !candidate.is_some_and(|candidate| token.verify(candidate)) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, "Bearer")],
+        )
+            .into_response();
     }
+    request
+        .extensions_mut()
+        .insert(auth::Authentication::Authenticated);
     next.run(request).await
 }
 
@@ -330,7 +354,7 @@ fn router(app: Arc<App>) -> Router {
     secured_router(app, None)
 }
 
-fn secured_router(app: Arc<App>, token: Option<BearerToken>) -> Router {
+fn secured_router(app: Arc<App>, token: Option<auth::ScopedToken>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/api/world", get(world))
@@ -368,6 +392,7 @@ fn tool_success(id: Value, value: Value) -> Value {
 
 async fn mcp(
     State(app): State<Arc<App>>,
+    Extension(authentication): Extension<auth::Authentication>,
     headers: HeaderMap,
     Json(input): Json<Value>,
 ) -> impl IntoResponse {
@@ -490,6 +515,9 @@ async fn mcp(
             let params = input.get("params").unwrap_or(&Value::Null);
             let name = params.get("name").and_then(Value::as_str).unwrap_or("");
             let args = params.get("arguments").unwrap_or(&Value::Null);
+            // The write gate for this request: the operator's opt-in plus
+            // the authentication the middleware already decided.
+            let policy = app.write_policy(authentication);
             // The target is the scope resolved atomically with the session
             // check above: the session's own selection, or the stable default
             // when it has not chosen (or the caller is anonymous). The
@@ -525,7 +553,9 @@ async fn mcp(
                         None => Ok(app.instances.default_snapshot()),
                     };
                     match credential {
-                        Ok(credential) => dispatch_tool(&app, &credential, name, args).await,
+                        Ok(credential) => {
+                            dispatch_tool(&app, &credential, policy, name, args).await
+                        }
                         Err(err) => Err(err),
                     }
                 }
@@ -558,6 +588,7 @@ async fn mcp(
 async fn dispatch_tool(
     app: &App,
     credential: &FoundryCredential,
+    policy: operations::WritePolicy,
     name: &str,
     args: &Value,
 ) -> anyhow::Result<Value> {
@@ -573,15 +604,15 @@ async fn dispatch_tool(
         .await
         .map_err(anyhow::Error::from),
         "create_document" | "modify_document" | "delete_document" => {
-            operations::write_document(&*app.client, credential, app.allow_writes, name, args)
+            operations::write_document(&*app.client, credential, policy, name, args)
                 .await
                 .map_err(anyhow::Error::from)
         }
         _ if file_tools::recognizes(name) => {
-            file_tools::call(&*app.client, credential, app.allow_writes, name, args).await
+            file_tools::call(&*app.client, credential, policy, name, args).await
         }
         _ if compendium_tools::recognizes(name) => {
-            compendium_tools::call(&*app.client, credential, app.allow_writes, name, args).await
+            compendium_tools::call(&*app.client, credential, policy, name, args).await
         }
         _ if read_tools::recognizes(name) => {
             read_tools::call(&*app.client, credential, name, args).await
@@ -595,6 +626,38 @@ fn validate_bind_addr(addr: SocketAddr) -> anyhow::Result<()> {
         anyhow::bail!("BIND_ADDR must be a loopback address; this server is unauthenticated");
     }
     Ok(())
+}
+
+/// Build the configured authentication token, bound to one configured
+/// instance scope.
+///
+/// `FORGEWIRE_BEARER_TOKEN` is the secret. `FORGEWIRE_BEARER_TOKEN_SCOPE`
+/// names the instance the token is issued for; when it is not set the token
+/// is issued for the stable default instance (the first configured entry).
+/// The scope must name exactly one configured instance, so a token minted
+/// for another instance cannot authenticate here.
+fn configured_token(
+    instances: &instances::Instances,
+    secret: Option<String>,
+    scope: Option<String>,
+) -> anyhow::Result<Option<auth::ScopedToken>> {
+    let Some(secret) = secret else {
+        if scope.is_some() {
+            anyhow::bail!("FORGEWIRE_BEARER_TOKEN_SCOPE requires FORGEWIRE_BEARER_TOKEN");
+        }
+        return Ok(None);
+    };
+    let scope = match scope {
+        Some(scope) => {
+            let index = instances.resolve_scope(&scope)?;
+            instances.canonical_scope(index)?
+        }
+        None => instances.canonical_scope(0)?,
+    };
+    Ok(Some(auth::ScopedToken::new(
+        auth::Scope::new(&scope)?,
+        secret,
+    )?))
 }
 
 #[tokio::main]
@@ -618,19 +681,35 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     let credentials: Vec<FoundryCredential> = serde_json::from_value(Value::Array(entries))?;
+    let instances = instances::Instances::new(credentials)?;
     let app = Arc::new(App {
         client: Arc::new(FoundryClient::new()?),
-        instances: instances::Instances::new(credentials)?,
+        instances: instances.clone(),
         selections: instances::Selections::new(),
         allow_writes: env::var("FOUNDRY_ALLOW_WRITES").as_deref() == Ok("true"),
     });
-    let token = match env::var("FORGEWIRE_BEARER_TOKEN") {
-        Ok(value) => Some(BearerToken::parse(value)?),
+    let secret = match env::var("FORGEWIRE_BEARER_TOKEN") {
+        Ok(value) => Some(value),
         Err(env::VarError::NotPresent) => None,
         Err(env::VarError::NotUnicode(_)) => {
             anyhow::bail!("invalid FORGEWIRE_BEARER_TOKEN configuration")
         }
     };
+    let scope = match env::var("FORGEWIRE_BEARER_TOKEN_SCOPE") {
+        Ok(value) => Some(value),
+        Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("invalid FORGEWIRE_BEARER_TOKEN_SCOPE configuration")
+        }
+    };
+    let token = configured_token(&instances, secret, scope)?;
+    if let Some(token) = &token {
+        // The scope is safe to log; the secret never is.
+        tracing::info!(
+            scope = %token.scope().as_str(),
+            "forgewire bearer authentication enabled"
+        );
+    }
     let router = secured_router(app, token);
     let addr: SocketAddr = env::var("BIND_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:8765".into())
@@ -655,13 +734,13 @@ mod tests {
         test_app(None)
     }
 
-    fn test_app(token: Option<BearerToken>) -> Router {
+    fn test_app(token: Option<auth::ScopedToken>) -> Router {
         secured_router(
             Arc::new(App {
                 client: Arc::new(FoundryClient::new().unwrap()),
                 allow_writes: false,
                 instances: instances::Instances::new(vec![FoundryCredential {
-                    id: None,
+                    id: Some("one".into()),
                     hostname: "localhost".into(),
                     userid: None,
                     username: None,
@@ -672,6 +751,16 @@ mod tests {
             }),
             token,
         )
+    }
+
+    /// The fixture token: issued for the scope of the test app's only
+    /// instance, with the fixture secret.
+    fn fixture_token() -> auth::ScopedToken {
+        auth::ScopedToken::new(
+            auth::Scope::new("one").unwrap(),
+            "fixture-token".to_owned(),
+        )
+        .unwrap()
     }
 
     async fn post(body: Value, version: Option<&str>) -> (StatusCode, Value) {
@@ -695,7 +784,7 @@ mod tests {
 
     #[tokio::test]
     async fn bearer_auth_protects_rest_and_mcp() {
-        let protected = test_app(Some(BearerToken::parse("fixture-token".into()).unwrap()));
+        let protected = test_app(Some(fixture_token()));
         for (method, path) in [
             ("GET", "/health"),
             ("GET", "/api/instances"),
@@ -703,11 +792,15 @@ mod tests {
         ] {
             for value in [
                 None,
-                Some("Basic fixture-token"),
+                Some("Basic one.fixture-token"),
                 Some("Bearer wrong"),
                 Some("Bearer"),
-                Some("Bearer fixture-token, Bearer fixture-token"),
-                Some("Bearer fixture-token extra"),
+                Some("Bearer one.fixture-token, Bearer one.fixture-token"),
+                Some("Bearer one.fixture-token extra"),
+                // The right secret, but issued for another instance.
+                Some("Bearer two.fixture-token"),
+                // The right scope, but the wrong secret.
+                Some("Bearer one.other-token"),
             ] {
                 let mut request = Request::builder()
                     .method(method)
@@ -735,8 +828,8 @@ mod tests {
                 .method(method)
                 .uri(path)
                 .header("host", "localhost")
-                .header("authorization", "Bearer fixture-token")
-                .header("authorization", "Bearer fixture-token")
+                .header("authorization", "Bearer one.fixture-token")
+                .header("authorization", "Bearer one.fixture-token")
                 .body(Body::empty())
                 .unwrap();
             let response = protected.clone().oneshot(request).await.unwrap();
@@ -749,7 +842,7 @@ mod tests {
                 .method(method)
                 .uri(path)
                 .header("host", "localhost")
-                .header("authorization", "Bearer fixture-token")
+                .header("authorization", "Bearer one.fixture-token")
                 .body(Body::empty())
                 .unwrap();
             assert_ne!(
@@ -763,13 +856,13 @@ mod tests {
     async fn valid_bearer_reaches_mcp_handler() {
         let request = Request::post("/mcp")
             .header("host", "localhost")
-            .header("authorization", "Bearer fixture-token")
+            .header("authorization", "Bearer one.fixture-token")
             .header("content-type", "application/json")
             .body(Body::from(
                 json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}).to_string(),
             ))
             .unwrap();
-        let response = test_app(Some(BearerToken::parse("fixture-token".into()).unwrap()))
+        let response = test_app(Some(fixture_token()))
             .oneshot(request)
             .await
             .unwrap();
@@ -791,23 +884,89 @@ mod tests {
             "abc===def",
             "\u{00e9}",
         ] {
-            assert!(BearerToken::parse(token.to_owned()).is_err());
+            assert!(
+                auth::ScopedToken::new(auth::Scope::new("one").unwrap(), token.to_owned()).is_err(),
+                "{token:?} must be refused"
+            );
         }
         for token in ["fixture-token", "a+/._~-=", "abc==="] {
-            assert!(BearerToken::parse(token.to_owned()).is_ok());
+            assert!(
+                auth::ScopedToken::new(auth::Scope::new("one").unwrap(), token.to_owned()).is_ok(),
+                "{token:?} must be accepted"
+            );
         }
+        // A scope is an instance identifier: it must be dot-free so the
+        // presented credential splits unambiguously.
+        for scope in ["", "one.two", "one two", "one:two", "one=two"] {
+            assert!(
+                auth::Scope::new(scope).is_err(),
+                "{scope:?} must be refused as a scope"
+            );
+        }
+        for scope in ["one", "campaign-2026", "0"] {
+            assert!(auth::Scope::new(scope).is_ok(), "{scope:?} must be a scope");
+        }
+    }
+
+    /// The configured token is bound to exactly one configured instance:
+    /// the stable default instance unless another one is named.
+    #[test]
+    fn the_configured_token_is_bound_to_one_instance_scope() {
+        let instances = instances::Instances::new(vec![
+            FoundryCredential {
+                id: Some("one".into()),
+                hostname: "one.example".into(),
+                userid: None,
+                username: None,
+                password: String::new(),
+            },
+            FoundryCredential {
+                id: Some("two".into()),
+                hostname: "two.example".into(),
+                userid: None,
+                username: None,
+                password: String::new(),
+            },
+        ])
+        .unwrap();
+
+        // The default scope is the stable default instance.
+        let token = configured_token(&instances, Some("secret".into()), None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(token.scope().as_str(), "one");
+        assert!(token.verify("one.secret"));
+        assert!(!token.verify("two.secret"));
+        assert!(!token.verify("one.other"));
+
+        // An explicit scope names another configured instance.
+        let token = configured_token(&instances, Some("secret".into()), Some("two".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(token.scope().as_str(), "two");
+        assert!(token.verify("two.secret"));
+        assert!(!token.verify("one.secret"));
+
+        // An unknown scope, a scope without a token, and an invalid secret
+        // all prevent startup.
+        assert!(configured_token(&instances, Some("secret".into()), Some("missing".into())).is_err());
+        assert!(configured_token(&instances, None, Some("one".into())).is_err());
+        assert!(configured_token(&instances, Some("bad secret".into()), None).is_err());
+
+        // No token configured: no authentication at all.
+        assert!(configured_token(&instances, None, None).unwrap().is_none());
     }
 
     #[tokio::test]
     async fn configured_auth_preserves_host_and_origin_defenses() {
-        let protected = test_app(Some(BearerToken::parse("fixture-token".into()).unwrap()));
+        let protected = test_app(Some(fixture_token()));
         for (host, origin, expected) in [
             ("evil.example", None, StatusCode::BAD_REQUEST),
             ("localhost", Some("null"), StatusCode::FORBIDDEN),
         ] {
             let mut request = Request::get("/health")
                 .header("host", host)
-                .header("authorization", "Bearer fixture-token");
+                .header("authorization", "Bearer one.fixture-token");
             if let Some(origin) = origin {
                 request = request.header("origin", origin);
             }
@@ -1071,7 +1230,7 @@ mod tests {
         let mut state = App {
             client: Arc::new(FoundryClient::new().unwrap()),
             instances: instances::Instances::new(vec![FoundryCredential {
-                id: None,
+                id: Some("one".into()),
                 hostname: "localhost".into(),
                 userid: None,
                 username: None,
@@ -1081,16 +1240,17 @@ mod tests {
             selections: instances::Selections::new(),
             allow_writes: true,
         };
+        // Writes need an authenticated request, so this app carries the
+        // fixture token and every request presents it.
+        let secured = secured_router(Arc::new(state.clone()), Some(fixture_token()));
         for name in ["create_document", "modify_document", "delete_document"] {
             let request = Request::post(format!("/api/write/{name}"))
                 .header("host", "localhost")
+                .header("authorization", "Bearer one.fixture-token")
                 .header("content-type", "application/json")
                 .body(Body::from("{}"))
                 .unwrap();
-            let rest_response = router(Arc::new(state.clone()))
-                .oneshot(request)
-                .await
-                .unwrap();
+            let rest_response = secured.clone().oneshot(request).await.unwrap();
             assert_eq!(rest_response.status(), StatusCode::BAD_REQUEST);
             let rest_body = to_bytes(rest_response.into_body(), usize::MAX)
                 .await
@@ -1098,13 +1258,11 @@ mod tests {
             let rest_error = String::from_utf8(rest_body.to_vec()).unwrap();
             let request = Request::post("/mcp")
                 .header("host", "localhost")
+                .header("authorization", "Bearer one.fixture-token")
                 .header("content-type", "application/json")
                 .body(Body::from(json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":{}}}).to_string()))
                 .unwrap();
-            let response = router(Arc::new(state.clone()))
-                .oneshot(request)
-                .await
-                .unwrap();
+            let response = secured.clone().oneshot(request).await.unwrap();
             let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
             let response: Value = serde_json::from_slice(&bytes).unwrap();
             assert_eq!(response["result"]["isError"], true);
@@ -1132,7 +1290,7 @@ mod tests {
         assert!(operations::write_document(
             &*state.client,
             &state.instances.default_snapshot(),
-            state.allow_writes,
+            operations::WritePolicy::authenticated(state.allow_writes),
             "create_document",
             &json!({})
         )

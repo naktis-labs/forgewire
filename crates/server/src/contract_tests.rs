@@ -271,8 +271,32 @@ fn credential(id: &str, hostname: &str) -> FoundryCredential {
     }
 }
 
+/// The bearer credential the shared helpers present: the scope of the first
+/// configured instance plus the fixture secret. Deployments without a
+/// configured token ignore it; deployments with one require it.
+const FIXTURE_CREDENTIAL: &str = "one.fixture-token";
+
+/// The fixture token: issued for the scope of the first configured instance.
+fn fixture_token() -> auth::ScopedToken {
+    auth::ScopedToken::new(
+        auth::Scope::new("one").unwrap(),
+        "fixture-token".to_owned(),
+    )
+    .unwrap()
+}
+
 fn contract_app(allow_writes: bool) -> (Router, Arc<FakeConnector>) {
     contract_app_with_sessions(allow_writes, instances::DEFAULT_SESSION_CAPACITY)
+}
+
+/// An app that requires the fixture token. Writes need an authenticated
+/// request, so the mutating contracts run against this one.
+fn contract_app_with_token(allow_writes: bool) -> (Router, Arc<FakeConnector>) {
+    contract_app_with_token_and_sessions(
+        allow_writes,
+        instances::DEFAULT_SESSION_CAPACITY,
+        Some(fixture_token()),
+    )
 }
 
 /// Tests that exercise session expiry inject a small capacity so a second
@@ -280,6 +304,14 @@ fn contract_app(allow_writes: bool) -> (Router, Arc<FakeConnector>) {
 fn contract_app_with_sessions(
     allow_writes: bool,
     session_capacity: usize,
+) -> (Router, Arc<FakeConnector>) {
+    contract_app_with_token_and_sessions(allow_writes, session_capacity, None)
+}
+
+fn contract_app_with_token_and_sessions(
+    allow_writes: bool,
+    session_capacity: usize,
+    token: Option<auth::ScopedToken>,
 ) -> (Router, Arc<FakeConnector>) {
     let fake = Arc::new(FakeConnector::new());
     let instances = instances::Instances::new(vec![
@@ -293,7 +325,7 @@ fn contract_app_with_sessions(
         selections: instances::Selections::with_capacity(session_capacity),
         allow_writes,
     };
-    (router(Arc::new(app)), fake)
+    (secured_router(Arc::new(app), token), fake)
 }
 
 async fn rest_send(
@@ -307,6 +339,7 @@ async fn rest_send(
         .uri(path)
         .header("host", "localhost")
         .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {FIXTURE_CREDENTIAL}"))
         .body(Body::from(
             body.map(|body| body.to_string()).unwrap_or_default(),
         ))
@@ -339,7 +372,8 @@ async fn mcp_call_as(
     let body = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":arguments}});
     let mut request = Request::post("/mcp")
         .header("host", "localhost")
-        .header("content-type", "application/json");
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {FIXTURE_CREDENTIAL}"));
     if let Some(id) = session {
         request = request.header("mcp-session-id", id);
     }
@@ -362,6 +396,7 @@ async fn mcp_initialize(router: &Router) -> String {
     let request = Request::post("/mcp")
         .header("host", "localhost")
         .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {FIXTURE_CREDENTIAL}"))
         .body(Body::from(body.to_string()))
         .unwrap();
     let response = router.clone().oneshot(request).await.unwrap();
@@ -384,7 +419,8 @@ async fn mcp_send(
 ) -> (StatusCode, Value, Option<String>) {
     let mut request = Request::post("/mcp")
         .header("host", "localhost")
-        .header("content-type", "application/json");
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {FIXTURE_CREDENTIAL}"));
     if let Some(id) = session {
         request = request.header("mcp-session-id", id);
     }
@@ -781,7 +817,7 @@ async fn rest_and_mcp_file_browsing_matches() {
 #[tokio::test]
 async fn rest_and_mcp_compendium_writes_share_gating_validation_and_effects() {
     // Disabled: both refuse before any connector contact.
-    let (router, fake) = contract_app(false);
+    let (router, fake) = contract_app_with_token(false);
     let (status, rest) = rest_send(
         &router,
         "POST",
@@ -808,7 +844,7 @@ async fn rest_and_mcp_compendium_writes_share_gating_validation_and_effects() {
     );
 
     // Enabled but invalid: identical validation failure, connector untouched.
-    let (router, fake) = contract_app(true);
+    let (router, fake) = contract_app_with_token(true);
     let (status, rest) = rest_send(
         &router,
         "POST",
@@ -850,7 +886,7 @@ async fn rest_and_mcp_compendium_writes_share_gating_validation_and_effects() {
 
 #[tokio::test]
 async fn rest_and_mcp_document_writes_share_gating_validation_and_effects() {
-    let (router, fake) = contract_app(false);
+    let (router, fake) = contract_app_with_token(false);
     for (operation, args) in [
         (
             "create_document",
@@ -880,7 +916,7 @@ async fn rest_and_mcp_document_writes_share_gating_validation_and_effects() {
     );
 
     // Enabled: identical validation, connector effects, and results.
-    let (router, fake) = contract_app(true);
+    let (router, fake) = contract_app_with_token(true);
     let (status, rest) = rest_send(
         &router,
         "POST",
@@ -954,7 +990,7 @@ async fn rest_and_mcp_document_writes_share_gating_validation_and_effects() {
 #[tokio::test]
 async fn rest_and_mcp_uploads_share_gating_overwrite_and_byte_parity() {
     let payload = STANDARD.encode(b"hello world");
-    let (router, fake) = contract_app(false);
+    let (router, fake) = contract_app_with_token(false);
     let args =
         json!({"target":"data/upload","filename":"a.png","data_base64":payload,"overwrite":true});
     let (status, rest) = rest_send(&router, "POST", "/api/files", Some(args.clone())).await;
@@ -965,7 +1001,7 @@ async fn rest_and_mcp_uploads_share_gating_overwrite_and_byte_parity() {
 
     // Enabled but the overwrite acknowledgement is missing, false, or not a
     // boolean: identical rejection on both transports.
-    let (router, fake) = contract_app(true);
+    let (router, fake) = contract_app_with_token(true);
     for overwrite in [Value::Null, json!(false), json!("yes")] {
         let mut args = json!({"target":"data/upload","filename":"a.png","data_base64":payload});
         if !overwrite.is_null() {
@@ -1002,7 +1038,7 @@ async fn rest_and_mcp_uploads_share_gating_overwrite_and_byte_parity() {
     let error = operations::upload_file(
         &*fake,
         &credential("one", "one.example"),
-        true,
+        operations::WritePolicy::authenticated(true),
         &json!({"target":"data/upload","filename":"big.png","data_base64":oversized,"overwrite":true}),
     )
     .await
@@ -1023,7 +1059,7 @@ async fn rest_and_mcp_uploads_share_gating_overwrite_and_byte_parity() {
 /// without ever disclosing secrets.
 #[tokio::test]
 async fn rest_targets_the_stable_default_or_an_explicit_instance() {
-    let (router, fake) = contract_app(true);
+    let (router, fake) = contract_app_with_token(true);
 
     // Default: the first configured entry.
     let (status, _) = rest_get(&router, "/api/world").await;
@@ -1200,7 +1236,8 @@ async fn mcp_selection_is_session_scoped_and_never_redirects_rest() {
 /// silently running against the stable default instance.
 #[tokio::test]
 async fn expired_sessions_are_refused_until_the_client_initializes_again() {
-    let (router, fake) = contract_app_with_sessions(true, 1);
+    let (router, fake) =
+        contract_app_with_token_and_sessions(true, 1, Some(fixture_token()));
 
     let session_a = mcp_initialize(&router).await;
     let (status, selected) = mcp_call_as(
@@ -1378,7 +1415,7 @@ async fn duplicate_and_non_utf8_session_headers_are_refused() {
 /// moves REST: REST keeps its stable default and its own explicit targeting.
 #[tokio::test]
 async fn every_foundry_rest_route_honors_the_instance_parameter() {
-    let (router, fake) = contract_app(true);
+    let (router, fake) = contract_app_with_token(true);
 
     let routes: [(&str, &str, Option<Value>); 10] = [
         ("GET", "/api/world", None),
