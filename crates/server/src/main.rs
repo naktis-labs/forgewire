@@ -250,6 +250,56 @@ async fn rest_write(
     .map_err(operation_status)
 }
 
+#[derive(Clone)]
+struct BearerToken(String);
+
+impl BearerToken {
+    fn parse(value: String) -> anyhow::Result<Self> {
+        // RFC 6750 b64token syntax, with padding allowed only at the end.
+        let token = value.trim_end_matches('=');
+        if token.is_empty()
+            || !token.bytes().all(|b| {
+                b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
+            })
+        {
+            anyhow::bail!("invalid FORGEWIRE_BEARER_TOKEN configuration");
+        }
+        Ok(Self(value))
+    }
+}
+
+async fn authenticate(
+    State(token): State<Option<BearerToken>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    use subtle::ConstantTimeEq;
+    if let Some(token) = token {
+        let mut values = request.headers().get_all(header::AUTHORIZATION).iter();
+        let candidate = values
+            .next()
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| {
+                let (scheme, credential) = value.split_once(' ')?;
+                if scheme.eq_ignore_ascii_case("bearer") {
+                    Some(credential.as_bytes())
+                } else {
+                    None
+                }
+            });
+        if values.next().is_some()
+            || !candidate.is_some_and(|candidate| bool::from(candidate.ct_eq(token.0.as_bytes())))
+        {
+            return (
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, "Bearer")],
+            )
+                .into_response();
+        }
+    }
+    next.run(request).await
+}
+
 async fn reject_origin(request: Request, next: Next) -> Response {
     let headers = request.headers();
     if headers.contains_key(header::ORIGIN) {
@@ -272,7 +322,12 @@ async fn reject_origin(request: Request, next: Next) -> Response {
     next.run(request).await
 }
 
+#[cfg(test)]
 fn router(app: Arc<App>) -> Router {
+    secured_router(app, None)
+}
+
+fn secured_router(app: Arc<App>, token: Option<BearerToken>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/api/world", get(world))
@@ -296,6 +351,7 @@ fn router(app: Arc<App>) -> Router {
         .route("/mcp", post(mcp))
         .with_state(app)
         .layer(DefaultBodyLimit::max(15 * 1024 * 1024))
+        .layer(middleware::from_fn_with_state(token, authenticate))
         .layer(middleware::from_fn(reject_origin))
 }
 
@@ -565,7 +621,14 @@ async fn main() -> anyhow::Result<()> {
         selections: instances::Selections::new(),
         allow_writes: env::var("FOUNDRY_ALLOW_WRITES").as_deref() == Ok("true"),
     });
-    let router = router(app);
+    let token = match env::var("FORGEWIRE_BEARER_TOKEN") {
+        Ok(value) => Some(BearerToken::parse(value)?),
+        Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("invalid FORGEWIRE_BEARER_TOKEN configuration")
+        }
+    };
+    let router = secured_router(app, token);
     let addr: SocketAddr = env::var("BIND_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:8765".into())
         .parse()?;
@@ -586,19 +649,26 @@ mod tests {
     use tower::ServiceExt;
 
     fn app() -> Router {
-        router(Arc::new(App {
-            client: Arc::new(FoundryClient::new().unwrap()),
-            allow_writes: false,
-            instances: instances::Instances::new(vec![FoundryCredential {
-                id: None,
-                hostname: "localhost".into(),
-                userid: None,
-                username: None,
-                password: String::new(),
-            }])
-            .unwrap(),
-            selections: instances::Selections::new(),
-        }))
+        test_app(None)
+    }
+
+    fn test_app(token: Option<BearerToken>) -> Router {
+        secured_router(
+            Arc::new(App {
+                client: Arc::new(FoundryClient::new().unwrap()),
+                allow_writes: false,
+                instances: instances::Instances::new(vec![FoundryCredential {
+                    id: None,
+                    hostname: "localhost".into(),
+                    userid: None,
+                    username: None,
+                    password: String::new(),
+                }])
+                .unwrap(),
+                selections: instances::Selections::new(),
+            }),
+            token,
+        )
     }
 
     async fn post(body: Value, version: Option<&str>) -> (StatusCode, Value) {
@@ -618,6 +688,136 @@ mod tests {
             status,
             serde_json::from_slice(&bytes).unwrap_or(Value::Null),
         )
+    }
+
+    #[tokio::test]
+    async fn bearer_auth_protects_rest_and_mcp() {
+        let protected = test_app(Some(BearerToken::parse("fixture-token".into()).unwrap()));
+        for (method, path) in [
+            ("GET", "/health"),
+            ("GET", "/api/instances"),
+            ("POST", "/mcp"),
+        ] {
+            for value in [
+                None,
+                Some("Basic fixture-token"),
+                Some("Bearer wrong"),
+                Some("Bearer"),
+                Some("Bearer fixture-token, Bearer fixture-token"),
+                Some("Bearer fixture-token extra"),
+            ] {
+                let mut request = Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("host", "localhost");
+                if let Some(value) = value {
+                    request = request.header("authorization", value);
+                }
+                let response = protected
+                    .clone()
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::UNAUTHORIZED,
+                    "{method} {path} {value:?}"
+                );
+                assert_eq!(
+                    response.headers().get(header::WWW_AUTHENTICATE).unwrap(),
+                    "Bearer"
+                );
+            }
+            let request = Request::builder()
+                .method(method)
+                .uri(path)
+                .header("host", "localhost")
+                .header("authorization", "Bearer fixture-token")
+                .header("authorization", "Bearer fixture-token")
+                .body(Body::empty())
+                .unwrap();
+            let response = protected.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                response.headers().get(header::WWW_AUTHENTICATE).unwrap(),
+                "Bearer"
+            );
+            let request = Request::builder()
+                .method(method)
+                .uri(path)
+                .header("host", "localhost")
+                .header("authorization", "Bearer fixture-token")
+                .body(Body::empty())
+                .unwrap();
+            assert_ne!(
+                protected.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn valid_bearer_reaches_mcp_handler() {
+        let request = Request::post("/mcp")
+            .header("host", "localhost")
+            .header("authorization", "Bearer fixture-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}).to_string(),
+            ))
+            .unwrap();
+        let response = test_app(Some(BearerToken::parse("fixture-token".into()).unwrap()))
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert!(body["result"]["tools"].is_array());
+    }
+
+    #[test]
+    fn bearer_token_configuration_is_strict() {
+        for token in [
+            "",
+            "=",
+            " ",
+            "token value",
+            "token\n",
+            "abc=def",
+            "abc===def",
+            "\u{00e9}",
+        ] {
+            assert!(BearerToken::parse(token.to_owned()).is_err());
+        }
+        for token in ["fixture-token", "a+/._~-=", "abc==="] {
+            assert!(BearerToken::parse(token.to_owned()).is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_auth_preserves_host_and_origin_defenses() {
+        let protected = test_app(Some(BearerToken::parse("fixture-token".into()).unwrap()));
+        for (host, origin, expected) in [
+            ("evil.example", None, StatusCode::BAD_REQUEST),
+            ("localhost", Some("null"), StatusCode::FORBIDDEN),
+        ] {
+            let mut request = Request::get("/health")
+                .header("host", host)
+                .header("authorization", "Bearer fixture-token");
+            if let Some(origin) = origin {
+                request = request.header("origin", origin);
+            }
+            assert_eq!(
+                protected
+                    .clone()
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status(),
+                expected
+            );
+        }
     }
 
     #[tokio::test]
