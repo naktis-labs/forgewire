@@ -1,0 +1,48 @@
+# Build artifacts — never part of an image build context.
+target/
+**/target/
+
+# Version control and local tooling state.
+.git/
+.gitignore
+.github/
+.superpowers/
+
+# Documentation build output.
+docs/_build/
+docs/build/
+docs/site/
+docs/public/
+_book/
+site/
+
+# Local secrets and credentials. The Foundry credentials file lives in
+# config/ by default and is mounted into the container at run time; it must
+# never reach a layer.
+config/
+**/foundry_credentials.json
+**/foundry_credentials*.json
+credentials.json
+**/credentials.json
+*.credentials.json
+secrets/
+**/secrets/
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa
+id_ed25519
+.netrc
+
+# Editor, IDE and OS noise.
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

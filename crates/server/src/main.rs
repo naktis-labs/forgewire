@@ -19,6 +19,9 @@ mod read_tools;
 #[cfg(test)]
 mod contract_tests;
 
+#[cfg(test)]
+mod packaging_tests;
+
 #[derive(Clone)]
 struct App {
     client: Arc<dyn operations::Connector>,

@@ -30,6 +30,16 @@ Protect this file with filesystem permissions (`chmod 600 config/foundry_credent
 cargo run -p forgewire-server
 ```
 
+### Container image
+
+A reproducible, rootless OCI definition for `forgewire-server` lives in `packaging/Dockerfile`. It compiles the release binary in a digest-pinned build stage, runs it as a non-root numeric user (UID 65532, no login shell), and keeps the final image to the binary plus the CA bundle. The runtime listens on loopback only (`BIND_ADDR=127.0.0.1:8765`, non-loopback addresses are rejected at startup) and carries no secrets: the bearer token is supplied through the environment at run time, and the Foundry credentials file is mounted read-only.
+
+```sh
+docker build --pull=false -f packaging/Dockerfile -t forgewire-server:0.1.0 .
+```
+
+See [`docs/packaging.md`](docs/packaging.md) for the full build, run and verification procedure, including how the bearer token and the Foundry instance are supplied.
+
 ## HTTP API
 
 - `GET /health` returns `{"status":"ok"}`.
