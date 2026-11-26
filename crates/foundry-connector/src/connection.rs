@@ -932,6 +932,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_cancelled_enqueue_drops_its_frame_instead_of_delivering_it() {
+        // The outbound queue is where a cancelled request's frame would
+        // otherwise still be handed to the socket: the frame must go with
+        // the cancelled request, not with the writer.
+        let (sender, mut receiver) = mpsc::channel(1);
+        let (written, _) = oneshot::channel();
+        sender
+            .send(Outbound {
+                message: Message::Text("occupies-channel".into()),
+                written,
+            })
+            .await
+            .unwrap();
+
+        let sender = sender.clone();
+        let task = tokio::spawn(async move {
+            enqueue_with_deadline(
+                &sender,
+                Message::Text("cancelled-frame".into()),
+                Duration::from_secs(30),
+            )
+            .await
+        });
+        // Let the enqueue reach the blocked hand-over, then cancel it.
+        tokio::task::yield_now().await;
+        task.abort();
+        let _ = task.await;
+
+        let received = receiver.recv().await.unwrap();
+        let Message::Text(text) = &received.message else {
+            panic!("expected a text frame");
+        };
+        assert_eq!(
+            text.as_str(),
+            "occupies-channel",
+            "the queued frame must be the first one"
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "the cancelled frame must never reach the writer"
+        );
+    }
+
+    #[tokio::test]
     async fn manager_capacity_evicts_idle_entries_and_stays_bounded() {
         let manager = ConnectionManager::with_limits(2, Duration::from_secs(60));
         manager.reserve(IdentityKey::new(&["one"])).await.unwrap();

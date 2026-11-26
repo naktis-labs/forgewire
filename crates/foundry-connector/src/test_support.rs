@@ -729,6 +729,143 @@ async fn cancelled_document_get_discards_socket_before_late_ack() {
     );
 }
 
+/// A change whose request is cancelled after its frame reached the instance
+/// is never replayed, and the cancelled connection is not reused.
+///
+/// The frame was written, so the change may have been applied: the point of
+/// the guarantee is that the gateway never sends it a second time, and that
+/// the next request starts from a connection that cannot still be carrying
+/// the cancelled one.
+#[tokio::test]
+async fn a_cancelled_change_is_never_replayed_and_discards_the_socket() {
+    let fake = FakeFoundry::start_canned("430[{\"world\":{}}]", 14, "s-test").await;
+    fake.state.hold_document_acks.store(true, Ordering::Release);
+    let client = FoundryClient::for_test(&fake.base_url).unwrap();
+    let credential = test_credential(&fake.base_url);
+
+    let change = tokio::spawn({
+        let client = client.clone();
+        let credential = credential.clone();
+        async move {
+            client
+                .create_document(
+                    &credential,
+                    "Actor",
+                    vec![json!({"name": "Hero"})],
+                    None,
+                    None,
+                )
+                .await
+        }
+    });
+    // The change reached the instance: its frame was written and the
+    // acknowledgement is held.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        fake.state.document_requests.acquire(),
+    )
+    .await
+    .expect("the change should reach fake Foundry")
+    .unwrap()
+    .forget();
+
+    // Cancel the request while the instance still owes an answer.
+    change.abort();
+    let _ = change.await;
+    // The instance answers the cancelled request on the socket that carried
+    // it, after the gateway has already moved on.
+    fake.state.release_document_acks.add_permits(128);
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // The next request runs on a connection of its own.
+    client.list_documents(&credential, "items").await.unwrap();
+
+    let requests = fake.state.requests.lock().unwrap();
+    let changes: Vec<_> = requests
+        .iter()
+        .filter(|request| request.contains("modifyDocument"))
+        .filter(|request| request.contains("\"action\":\"create\""))
+        .collect();
+    assert_eq!(
+        changes.len(),
+        1,
+        "the change must not be replayed: {requests:?}"
+    );
+    let sockets: std::collections::HashSet<_> = requests
+        .iter()
+        .filter(|request| request.contains("modifyDocument"))
+        .filter_map(|request| request.split("socket=").nth(1))
+        .collect();
+    assert_eq!(
+        sockets.len(),
+        2,
+        "the cancelled socket must not be reused: {requests:?}"
+    );
+}
+
+/// A change whose connection is invalidated before the instance answers is
+/// reported as an unknown outcome and is never replayed, and the stale
+/// socket's teardown does not take the successor down with it.
+#[tokio::test]
+async fn a_change_on_an_invalidated_connection_is_ambiguous_and_never_replayed() {
+    let fake = FakeFoundry::start_canned("430[{\"world\":{}}]", 14, "s-test").await;
+    // The instance closes the socket instead of answering the change.
+    fake.state
+        .disconnect_on_mutation
+        .store(true, Ordering::Release);
+    let client = FoundryClient::for_test(&fake.base_url).unwrap();
+    let credential = test_credential(&fake.base_url);
+
+    let error = client
+        .create_document(
+            &credential,
+            "Actor",
+            vec![json!({"name": "Hero"})],
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    // The outcome is unknown, and the gateway says so with its own type.
+    assert!(
+        error.downcast_ref::<crate::AmbiguousMutation>().is_some(),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("may have been applied"),
+        "{error}"
+    );
+
+    // The successor connection is unaffected by the stale socket's teardown.
+    fake.state
+        .disconnect_on_mutation
+        .store(false, Ordering::Release);
+    let documents = client.list_documents(&credential, "items").await.unwrap();
+    assert_eq!(documents[0]["name"], "Item");
+
+    let requests = fake.state.requests.lock().unwrap();
+    let changes: Vec<_> = requests
+        .iter()
+        .filter(|request| request.contains("modifyDocument"))
+        .filter(|request| request.contains("\"action\":\"create\""))
+        .collect();
+    assert_eq!(
+        changes.len(),
+        1,
+        "the change must not be replayed: {requests:?}"
+    );
+    let sockets: std::collections::HashSet<_> = requests
+        .iter()
+        .filter(|request| request.contains("modifyDocument"))
+        .filter_map(|request| request.split("socket=").nth(1))
+        .collect();
+    assert_eq!(
+        sockets.len(),
+        2,
+        "the invalidated socket must not be reused: {requests:?}"
+    );
+}
+
 #[tokio::test]
 async fn distinct_credential_identities_progress_concurrently() {
     let fake = FakeFoundry::start_canned("430[{\"world\":{}}]", 14, "s-test").await;
