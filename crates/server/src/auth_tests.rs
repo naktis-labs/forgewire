@@ -690,7 +690,7 @@ async fn mcp_instance_selection_for_another_instance_is_refused() {
     assert_eq!(response["result"]["isError"], false);
     assert_eq!(
         response["result"]["content"][0]["text"],
-        "{\"item_order\":0,\"selected\":true}"
+        "{\"_id\":\"one\",\"connection_verified\":false,\"hostname\":\"one.example\",\"item_order\":0,\"selected\":true}"
     );
 }
 

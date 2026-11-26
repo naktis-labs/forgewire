@@ -202,11 +202,28 @@ impl Instances {
                 .collect(),
         )
     }
-}
 
-/// The selection report: selection only, never a verified connection.
-pub fn selection_report(index: usize) -> Value {
-    json!({"item_order": index, "selected": true})
+    /// The report of a recorded selection: which instance was chosen, and
+    /// where it points.
+    ///
+    /// The reference answers a selection with the hostname it connected to.
+    /// The gateway reports the same identifying details — the configured
+    /// instance id and hostname, which the listing already exposes — without
+    /// the username and without claiming a connection was verified.
+    pub fn selection_report(&self, index: usize) -> Value {
+        let (id, hostname) = self
+            .credentials
+            .get(index)
+            .map(|credential| (credential.id.clone(), credential.hostname.clone()))
+            .unwrap_or((None, String::new()));
+        json!({
+            "item_order": index,
+            "selected": true,
+            "_id": id,
+            "hostname": hostname,
+            "connection_verified": false,
+        })
+    }
 }
 
 /// Bounded table of server-issued MCP sessions and their per-client instance
@@ -408,7 +425,23 @@ mod tests {
         }
         // Resolution is pure: nothing was stored or connected.
         assert_eq!(instances.default_snapshot().id.as_deref(), Some("first"));
-        assert_eq!(selection_report(2), json!({"item_order":2,"selected":true}));
+    }
+
+    #[test]
+    fn selection_report_names_the_chosen_instance_without_a_secret() {
+        let instances = Instances::new(vec![credential("first"), credential("second")]).unwrap();
+        let report = instances.selection_report(1);
+        assert_eq!(report["item_order"], 1);
+        assert_eq!(report["selected"], true);
+        assert_eq!(report["_id"], "second");
+        assert_eq!(report["hostname"], "second.example");
+        // The report never claims the connection was verified: the gateway
+        // records a selection, it does not connect to confirm it.
+        assert_eq!(report["connection_verified"], false);
+        // Neither the username nor the password is disclosed.
+        let rendered = report.to_string();
+        assert!(!rendered.contains("login-second"));
+        assert!(!rendered.contains("secret-second"));
     }
 
     #[test]

@@ -705,7 +705,7 @@ fn mcp_selection(
     let index =
         targeting::authorize(&app.instances, index, authentication).map_err(target_error)?;
     if app.selections.select(session, index) {
-        Ok(instances::selection_report(index))
+        Ok(app.instances.selection_report(index))
     } else {
         Err(operations::OperationError::invalid(
             "unknown or expired MCP session; initialize again",

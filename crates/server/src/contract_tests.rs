@@ -1618,8 +1618,14 @@ async fn mcp_selection_is_session_scoped_and_never_redirects_rest() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         selected["result"]["structuredContent"],
-        json!({"item_order": 1, "selected": true}),
-        "selection reports selection only, not a verified connection"
+        json!({
+            "item_order": 1,
+            "selected": true,
+            "_id": "two",
+            "hostname": "two.example",
+            "connection_verified": false
+        }),
+        "selection reports the chosen instance, never a verified connection"
     );
     let (_, mcp) = mcp_call_as(&router, Some(&session_a), "get_world", json!({})).await;
     assert_eq!(mcp["result"]["isError"], false);

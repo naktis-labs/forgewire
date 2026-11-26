@@ -83,8 +83,11 @@ Things the recorded run settled that the fake world could not:
   pack's own name both reach the same pack, and the pack listing reports a
   world pack's name next to its id. A package pack has no deletable name:
   its name repeats in the world scope and would name a different pack. A pack
-  the world does not advertise is refused with `400` before the instance sees
-  it, whether it is named by its own name or by a pack id.
+  the world does not advertise is refused with `404` before the instance sees
+  it, whether it is named by its own name or by a pack id, because the refusal
+  is a lookup miss rather than an upstream fault. A reference that is one
+  pack's id and another pack's name at once is refused with `400`, and deletes
+  neither.
 - Foundry 14 refuses `MeasuredTemplate`, a document type it deprecated,
   without sending an acknowledgement. The gateway reports such a change as
   `502` with `"outcome": "possibly_applied"`, because there is no answer that
@@ -92,6 +95,17 @@ Things the recorded run settled that the fake world could not:
 - A browse and an upload take a directory relative to the instance's data
   root, so a world lives under `worlds/<world>`. The instance refuses an
   upload whose target directory does not exist.
+- A document inside a compendium pack is created, read back, changed, read
+  back again and deleted over the real protocol, so a pack-scoped change is
+  exercised end to end and not only against the fixture.
+- An embedded document is updated through its parent document, and the live
+  run updates every embedded kind the instance accepts. A wall's light is an
+  enumerated sense type (`0` none, `10` limited, `20` normal), not a
+  boolean, so the live update sends `10`.
+- The world's own metadata carries its kind (`world`), the core-version range
+  it declares (`compatibility`), the release channel, its playtime and when
+  it was last played; the gateway exposes those and keeps the world's flags,
+  relationships and session state out.
 
 ## Real disposable world (manual, separate environment)
 

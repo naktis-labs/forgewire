@@ -115,12 +115,32 @@ pub struct FoundryClient {
     loopback_base_url: Option<Url>,
 }
 
+/// The core-version range a world declares itself compatible with.
+///
+/// The reference exposes the world's `compatibility` object whole; the
+/// gateway keeps only the two version bounds, because every other key in
+/// that object is a Foundry-internal flag.
+#[derive(Clone, Debug, Serialize)]
+pub struct Compatibility {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub minimum: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified: Option<String>,
+}
+
+/// The world's own metadata, narrowed to the fields the reference's
+/// `get_world` exposes and that are safe to hand to a caller.
+///
+/// The allowlist is deliberate: document collection bodies, the world's
+/// `flags`, the session state and the package inventory stay out, and every
+/// string is trimmed and bounded.
 #[derive(Clone, Debug, Serialize)]
 pub struct WorldInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     pub title: Option<String>,
     pub system: Option<String>,
+    /// The core version the world runs (`coreVersion` in the world payload).
     pub version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub world_version: Option<String>,
@@ -128,6 +148,9 @@ pub struct WorldInfo {
     pub release_generation: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub release_build: Option<Value>,
+    /// The release channel the instance runs (`stable`, `test`, …).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_channel: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -138,6 +161,22 @@ pub struct WorldInfo {
     pub system_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub background: Option<String>,
+    /// The kind of world (`world` for a normal world).
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub world_type: Option<String>,
+    /// The core-version range the world declares itself compatible with.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compatibility: Option<Compatibility>,
+    /// How long the world has been played, in seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub playtime: Option<u64>,
+    /// When the world was last opened.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_played: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub languages: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub modules: Vec<Value>,
 }
@@ -611,8 +650,58 @@ fn world_info(result: &Value) -> WorldInfo {
         url: world_string(meta, "url"),
         system_version: world_string(meta, "systemVersion"),
         background: world_string(meta, "background"),
+        release_channel: result
+            .get("release")
+            .and_then(|release| release.get("channel"))
+            .and_then(Value::as_str)
+            .and_then(bounded_string),
+        world_type: world_string(meta, "type"),
+        compatibility: safe_compatibility(meta.get("compatibility")),
+        playtime: meta.get("playtime").and_then(Value::as_u64),
+        last_played: world_string(meta, "lastPlayed"),
+        tags: safe_string_list(meta.get("tags"), MAX_WORLD_TAGS),
+        languages: safe_string_list(meta.get("languages"), MAX_WORLD_LANGUAGES),
         modules: safe_modules(result.get("modules")),
     }
+}
+
+/// The bound on the world's tag list: enough for a real world's tags, and
+/// small enough that a hostile world cannot inflate the metadata response.
+const MAX_WORLD_TAGS: usize = 32;
+/// The bound on the world's language list.
+const MAX_WORLD_LANGUAGES: usize = 32;
+
+/// The world's own `compatibility` object, reduced to the two version
+/// bounds. Every other key in that object is a Foundry-internal flag and
+/// stays out.
+fn safe_compatibility(value: Option<&Value>) -> Option<Compatibility> {
+    let value = value?;
+    let minimum = value
+        .get("minimum")
+        .and_then(Value::as_str)
+        .and_then(bounded_string);
+    let verified = value
+        .get("verified")
+        .and_then(Value::as_str)
+        .and_then(bounded_string);
+    if minimum.is_none() && verified.is_none() {
+        return None;
+    }
+    Some(Compatibility { minimum, verified })
+}
+
+/// A bounded list of short strings (the world's tags and languages).
+fn safe_string_list(value: Option<&Value>, limit: usize) -> Vec<String> {
+    value
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().and_then(bounded_string))
+                .take(limit)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn bounded_number(value: Option<&Value>) -> Option<Value> {
@@ -1573,6 +1662,13 @@ mod tests {
                 "authors": [{"name":" A. Author ","url":" https://author.test ","email":"private@example.test"}],
                 "url": "https://example.test/world",
                 "background": "worlds/summerlands/bg.webp",
+                "type": " world ",
+                "compatibility": {"minimum":" 14 ","verified":"14","flags":{"secret":"omit"}},
+                "playtime": 3600,
+                "lastPlayed": " Thu Nov 26 2026 16:38:26 GMT+0000 ",
+                "tags": [" campaign ", 7, "  ", "spoiler"],
+                "languages": [" en "],
+                "flags": {"secret": "omit"},
                 "actors": [{"name": "Must not leak"}],
                 "users": [{"password": "secret"}],
                 "session": {"userId": "secret"},
@@ -1584,7 +1680,8 @@ mod tests {
             ],
             "scenes": [{"name":"Must not leak"}],
             "settings": {"private":"secret"},
-            "users": [{"password":"secret"}]
+            "users": [{"password":"secret"}],
+            "release": {"generation": 14, "build": 370, "channel": " stable ", "flags": {"secret": "omit"}}
         }));
 
         assert_eq!(info.title.as_deref(), Some("Summerlands"));
@@ -1603,6 +1700,28 @@ mod tests {
             info.background.as_deref(),
             Some("worlds/summerlands/bg.webp")
         );
+        assert_eq!(info.world_type.as_deref(), Some("world"));
+        assert_eq!(
+            info.compatibility
+                .as_ref()
+                .and_then(|c| c.minimum.as_deref()),
+            Some("14")
+        );
+        assert_eq!(
+            info.compatibility
+                .as_ref()
+                .and_then(|c| c.verified.as_deref()),
+            Some("14")
+        );
+        assert_eq!(info.playtime, Some(3600));
+        assert_eq!(
+            info.last_played.as_deref(),
+            Some("Thu Nov 26 2026 16:38:26 GMT+0000")
+        );
+        // Non-string and blank tag entries are dropped, not rendered.
+        assert_eq!(info.tags, vec!["campaign".to_owned(), "spoiler".to_owned()]);
+        assert_eq!(info.languages, vec!["en".to_owned()]);
+        assert_eq!(info.release_channel.as_deref(), Some("stable"));
         assert_eq!(info.modules.len(), 2);
         assert_eq!(info.modules[0]["id"], "module-a");
         assert_eq!(info.modules[0]["title"], "Module A");
@@ -1612,11 +1731,15 @@ mod tests {
         assert!(info.modules[0].get("token").is_none());
         let output = serde_json::to_value(info).unwrap();
         for excluded in [
-            "actors", "users", "session", "password", "scenes", "settings",
+            "actors", "users", "session", "password", "scenes", "settings", "flags",
         ] {
             assert!(output.get(excluded).is_none(), "{excluded} leaked");
         }
         assert!(!output.to_string().contains("private@example.test"));
+        // The compatibility object's internal flags and the release flags stay
+        // out: only the version bounds and the channel are exposed.
+        assert!(output["compatibility"].get("flags").is_none());
+        assert!(!output.to_string().contains("omit"));
     }
 
     #[test]
@@ -1663,5 +1786,38 @@ mod tests {
         let info = world_info(&world);
         assert_eq!(info.title.as_deref(), Some("My World"));
         assert_eq!(info.system.as_deref(), Some("dnd5e"));
+    }
+
+    #[test]
+    fn world_metadata_bounds_the_tag_and_language_lists() {
+        let tags: Vec<Value> = (0..100).map(|i| json!(format!("tag-{i}"))).collect();
+        let languages: Vec<Value> = (0..100).map(|i| json!(format!("lang-{i}"))).collect();
+        let info = world_info(&json!({
+            "world": {"tags": tags, "languages": languages}
+        }));
+        assert_eq!(info.tags.len(), MAX_WORLD_TAGS);
+        assert_eq!(info.languages.len(), MAX_WORLD_LANGUAGES);
+        assert_eq!(info.tags[0], "tag-0");
+    }
+
+    #[test]
+    fn world_metadata_reports_compatibility_only_for_version_bounds() {
+        // A compatibility object without version bounds carries no
+        // information worth exposing, so it is omitted rather than reported
+        // as an empty object.
+        let info = world_info(&json!({"world": {"compatibility": {"flags": {"a": 1}}}}));
+        assert!(info.compatibility.is_none());
+        let info = world_info(&json!({"world": {"compatibility": {"minimum": "14"}}}));
+        assert_eq!(
+            info.compatibility
+                .as_ref()
+                .and_then(|c| c.minimum.as_deref()),
+            Some("14")
+        );
+        assert!(info
+            .compatibility
+            .as_ref()
+            .and_then(|c| c.verified.as_deref())
+            .is_none());
     }
 }
