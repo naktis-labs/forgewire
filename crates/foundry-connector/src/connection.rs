@@ -947,7 +947,12 @@ mod tests {
             .unwrap();
 
         let sender = sender.clone();
-        let task = tokio::spawn(async move {
+        let (started, started_rx) = oneshot::channel();
+        let mut task = tokio::spawn(async move {
+            // The signal fires before the enqueue is attempted, so the test
+            // can tell "the enqueue was waiting for room" apart from "the
+            // enqueue never ran".
+            let _ = started.send(());
             enqueue_with_deadline(
                 &sender,
                 Message::Text("cancelled-frame".into()),
@@ -955,8 +960,16 @@ mod tests {
             )
             .await
         });
-        // Let the enqueue reach the blocked hand-over, then cancel it.
-        tokio::task::yield_now().await;
+        // Let the enqueue reach the blocked hand-over, then cancel it. The
+        // queue is full, so the enqueue cannot finish: it is waiting for
+        // room, and the abort cancels it there.
+        started_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut task)
+                .await
+                .is_err(),
+            "the enqueue must still be waiting for room in the queue"
+        );
         task.abort();
         let _ = task.await;
 

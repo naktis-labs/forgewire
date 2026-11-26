@@ -164,7 +164,16 @@ async fn terminal_authentication_failure_is_not_retried_by_world_connection() {
     let client = FoundryClient::for_test(&fake.base_url).unwrap();
     let credential = test_credential(&fake.base_url);
 
-    let error = client.world(&credential).await.unwrap_err().to_string();
+    let error = client.world(&credential).await.unwrap_err();
+    // The failure is typed, so the server classifies it as an upstream
+    // authentication refusal instead of a plain transport fault.
+    assert!(
+        error
+            .downcast_ref::<crate::UpstreamAuthentication>()
+            .is_some(),
+        "the refusal lost its type: {error}"
+    );
+    let error = error.to_string();
     assert!(error.contains("Foundry authentication failed"), "{error}");
     let requests = fake.state.requests.lock().unwrap();
     assert_eq!(
@@ -219,8 +228,16 @@ async fn authentication_non_success_status_with_success_body_is_rejected() {
     let error = client
         .world(&test_credential(&fake.base_url))
         .await
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
+    // A non-success status is an upstream authentication refusal, and it
+    // keeps its type through the connector's error context.
+    assert!(
+        error
+            .downcast_ref::<crate::UpstreamAuthentication>()
+            .is_some(),
+        "the refusal lost its type: {error}"
+    );
+    let error = error.to_string();
     assert!(error.contains("Foundry authentication failed"), "{error}");
     let requests = fake.state.requests.lock().unwrap();
     assert_eq!(
@@ -1352,8 +1369,16 @@ async fn an_unsuccessful_session_request_is_terminal_and_not_retried() {
     let error = client
         .list_documents(&credential, "actors")
         .await
-        .unwrap_err()
-        .to_string();
+        .unwrap_err();
+    // The refused session request is an upstream authentication refusal, and
+    // the type survives the connection's error context.
+    assert!(
+        error
+            .downcast_ref::<crate::UpstreamAuthentication>()
+            .is_some(),
+        "the refusal lost its type: {error}"
+    );
+    let error = error.to_string();
     assert!(error.contains("unsuccessful status 403"), "{error}");
     let joins = fake
         .request_log()

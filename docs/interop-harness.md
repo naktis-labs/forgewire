@@ -106,6 +106,10 @@ Things the recorded run settled that the fake world could not:
   it declares (`compatibility`), the release channel, its playtime and when
   it was last played; the gateway exposes those and keeps the world's flags,
   relationships and session state out.
+- The instance publishes the name of every world pack next to its id, so a
+  compendium delete resolves the pack the caller named. Nothing is inferred
+  from the id's shape: a pack the world does not publish a name for is
+  refused, because the suffix of an id may be the name of a different pack.
 
 ## Real disposable world (manual, separate environment)
 

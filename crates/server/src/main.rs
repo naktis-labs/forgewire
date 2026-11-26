@@ -1202,6 +1202,12 @@ mod tests {
                 StatusCode::BAD_GATEWAY,
             ),
             (
+                operations::OperationError::UpstreamAuthentication(anyhow::anyhow!(
+                    "the instance refused the gateway"
+                )),
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
                 operations::OperationError::PotentiallyApplied(anyhow::anyhow!(
                     "change may have been applied"
                 )),

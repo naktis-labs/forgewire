@@ -331,7 +331,9 @@ pub async fn world(
     client: &dyn Connector,
     target: &FoundryCredential,
 ) -> Result<Value, OperationError> {
-    client.world(target).await.map_err(OperationError::Upstream)
+    // The same classifier every other read uses, so an upstream
+    // authentication refusal keeps its type here too.
+    client.world(target).await.map_err(classify_read_failure)
 }
 
 /// List a world collection. The name is validated by the same shared parse
@@ -692,7 +694,7 @@ pub async fn read(
         return client
             .get_compendiums(target, kind)
             .await
-            .map_err(OperationError::Upstream);
+            .map_err(classify_read_failure);
     }
     let req = parse_read(name, args).map_err(OperationError::Invalid)?;
     execute_read(client, target, &req).await

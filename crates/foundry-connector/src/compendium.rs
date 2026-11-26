@@ -19,11 +19,13 @@ fn pack_operation(pack: &str, query: Value) -> Value {
 ///
 /// Two rules keep a destructive delete away from an unintended pack:
 ///
-/// - A reference that is one pack's id *and* another pack's own name is
-///   ambiguous, and it deletes neither.
+/// - A reference that is one pack's id *and* a *different* pack's own name
+///   is ambiguous, and it deletes neither.
 /// - The bare name the delete carries must be the name of exactly one
-///   advertised world pack. Nothing is inferred from the id's shape: the
-///   target is always a pack the world has published.
+///   advertised world pack, and it must be a name the world published for
+///   the pack that was named. Nothing is inferred from the id's shape: the
+///   suffix of an id may be the name of a different pack, and a delete that
+///   reached that pack would destroy a pack the caller never named.
 pub fn resolve_pack_name(packs: &Value, requested: &str) -> Result<String> {
     let requested = requested.trim();
     if requested.is_empty() {
@@ -32,25 +34,33 @@ pub fn resolve_pack_name(packs: &Value, requested: &str) -> Result<String> {
     let list: Vec<&Value> = packs.as_array().into_iter().flatten().collect();
 
     // The pack the reference names by its id, and the world pack it names
-    // by its own name.
-    let by_id: Vec<&Value> = list
+    // by its own name. Both are tracked by position, so the two can be
+    // compared as packs and not merely as lists.
+    let by_id: Vec<usize> = list
         .iter()
-        .copied()
-        .filter(|pack| pack.get("id").and_then(Value::as_str) == Some(requested))
+        .enumerate()
+        .filter(|(_, pack)| pack.get("id").and_then(Value::as_str) == Some(requested))
+        .map(|(index, _)| index)
         .collect();
-    let by_name: Vec<&Value> = list
+    let by_name: Vec<usize> = list
         .iter()
-        .copied()
-        .filter(|pack| {
+        .enumerate()
+        .filter(|(_, pack)| {
             read_ops::is_world_pack(pack)
                 && pack.get("name").and_then(Value::as_str) == Some(requested)
         })
+        .map(|(index, _)| index)
         .collect();
 
-    if !by_id.is_empty() && !by_name.is_empty() {
-        return Err(crate::invalid_input(format!(
-            "Compendium pack \"{requested}\" is the id of one pack and the name of another. Delete it by a name that names exactly one pack."
-        )));
+    // A reference that is the id of one pack and the name of a *different*
+    // pack could delete either of them, so it deletes neither. A pack whose
+    // id and name coincide names one pack, so it is not ambiguous.
+    if let (Some(&by_id_index), Some(&by_name_index)) = (by_id.first(), by_name.first()) {
+        if by_id_index != by_name_index {
+            return Err(crate::invalid_input(format!(
+                "Compendium pack \"{requested}\" is the id of one pack and the name of another. Delete it by a name that names exactly one pack."
+            )));
+        }
     }
     if by_id.len() > 1 || by_name.len() > 1 {
         return Err(crate::invalid_input(format!(
@@ -59,7 +69,8 @@ pub fn resolve_pack_name(packs: &Value, requested: &str) -> Result<String> {
     }
 
     // The bare name the delete has to carry.
-    let candidate = if let Some(pack) = by_id.first() {
+    let candidate = if let Some(&index) = by_id.first() {
+        let pack = list[index];
         if !read_ops::is_world_pack(pack) {
             return Err(crate::invalid_input(format!(
                 "Compendium pack \"{requested}\" is not a world compendium and cannot be deleted."
@@ -72,14 +83,16 @@ pub fn resolve_pack_name(packs: &Value, requested: &str) -> Result<String> {
             .filter(|name| !name.is_empty())
         {
             Some(name) => name.to_owned(),
-            // The world did not advertise the name, so the only candidate is
-            // the id's own suffix. It is still verified below against the
-            // advertised world packs, so it is a confirmation and not a
-            // guess.
-            None => requested
-                .strip_prefix("world.")
-                .unwrap_or(requested)
-                .to_owned(),
+            // The world did not publish this pack's name, so there is no
+            // name the caller could have named it by. Nothing is inferred
+            // from the id's shape: the id's suffix may be the name of a
+            // *different* pack, and a delete that reaches that pack would
+            // destroy a pack the caller never named.
+            None => {
+                return Err(crate::invalid_input(format!(
+                    "Compendium pack \"{requested}\" does not publish a name, so it cannot be deleted by a name that names exactly one pack."
+                )))
+            }
         }
     } else if !by_name.is_empty() {
         requested.to_owned()
@@ -299,9 +312,9 @@ mod tests {
         assert!(error.contains("more than one pack"), "{error}");
     }
 
-    /// The delete's bare name is verified against the advertised packs: a
-    /// pack whose name the world does not publish is not deletable, and the
-    /// id's shape is never taken as proof of a name.
+    /// A pack the world does not publish a name for is not deletable, and
+    /// the id's shape is never taken as proof of a name: the suffix of an
+    /// id may be the name of a *different* pack.
     #[test]
     fn a_pack_without_an_advertised_name_is_not_deletable() {
         let unnamed = json!([
@@ -310,25 +323,38 @@ mod tests {
         let error = resolve_pack_name(&unnamed, "world.ghost")
             .unwrap_err()
             .to_string();
-        assert!(
-            error.contains("does not resolve to an advertised world compendium"),
-            "{error}"
-        );
+        assert!(error.contains("does not publish a name"), "{error}");
     }
 
-    /// A world pack whose id carries a name the world does advertise
-    /// resolves through that name, and the name is confirmed rather than
-    /// assumed.
+    /// The dangerous case: the id's suffix names a pack the caller did not
+    /// name, so the delete must not reach it.
     #[test]
-    fn an_id_without_an_advertised_name_resolves_only_through_a_published_name() {
-        let published = json!([
+    fn an_unnamed_pack_never_deletes_the_pack_its_id_suffix_names() {
+        let colliding = json!([
             {"id":"world.lore","label":"Lore","type":"Actor","packageType":"world"},
             {"id":"world.other","name":"lore","label":"Other","type":"Actor","packageType":"world"},
         ]);
-        // The id names a pack the world does not publish a name for, but the
-        // bare name it resolves to is an advertised world pack's name.
+        let error = resolve_pack_name(&colliding, "world.lore")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("does not publish a name"), "{error}");
+        // The pack the caller actually named stays reachable by the name the
+        // world published for it.
         assert_eq!(
-            resolve_pack_name(&published, "world.lore").unwrap(),
+            resolve_pack_name(&colliding, "world.other").unwrap(),
+            "lore".to_owned()
+        );
+    }
+
+    /// A pack whose id and name coincide names exactly one pack, so it is
+    /// not ambiguous and stays deletable.
+    #[test]
+    fn a_pack_whose_id_and_name_coincide_is_not_ambiguous() {
+        let coinciding = json!([
+            {"id":"lore","name":"lore","label":"Lore","type":"Actor","packageType":"world"},
+        ]);
+        assert_eq!(
+            resolve_pack_name(&coinciding, "lore").unwrap(),
             "lore".to_owned()
         );
     }
