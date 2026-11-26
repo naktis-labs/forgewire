@@ -222,6 +222,21 @@ fn holds_id(parent: &Value, id: &str) -> bool {
     }
 }
 
+/// The embedded document of that id inside a parent document, if the parent
+/// holds one.
+fn embedded(parent: &Value, id: &str) -> Option<Value> {
+    match parent {
+        Value::Array(items) => items.iter().find_map(|item| embedded(item, id)),
+        Value::Object(map) => {
+            if map.get("_id").and_then(Value::as_str) == Some(id) {
+                return Some(parent.clone());
+            }
+            map.values().find_map(|value| embedded(value, id))
+        }
+        _ => None,
+    }
+}
+
 #[tokio::test]
 async fn the_real_instance_serves_reads_over_both_transports() {
     let Some((router, bearer, _world)) = gateway().await else {
@@ -243,6 +258,19 @@ async fn the_real_instance_serves_reads_over_both_transports() {
     }
     assert!(world["title"].is_string(), "{world}");
     assert!(world["id"].is_string(), "{world}");
+    // The world descriptor the reference exposes and the gateway narrowed:
+    // the world's kind, the core-version range it declares, the release
+    // channel the instance runs, and how long it has been played.
+    assert!(world["type"].is_string(), "{world}");
+    assert!(world["compatibility"]["minimum"].is_string(), "{world}");
+    assert!(world["compatibility"]["verified"].is_string(), "{world}");
+    assert!(world["release_channel"].is_string(), "{world}");
+    assert!(world["playtime"].is_number(), "{world}");
+    assert!(world["last_played"].is_string(), "{world}");
+    // The instance's own session state never reaches the metadata.
+    assert!(world.get("users").is_none(), "{world}");
+    assert!(world.get("session").is_none(), "{world}");
+    assert!(world.get("flags").is_none(), "{world}");
 
     // The same read over MCP matches the REST read.
     let (status, mcp_world) = mcp(&router, &bearer, "get_world", json!({})).await;
@@ -250,6 +278,15 @@ async fn the_real_instance_serves_reads_over_both_transports() {
     let mcp_world = mcp_payload(&mcp_world);
     assert_eq!(mcp_world["id"], world["id"], "{mcp_world}");
     assert_eq!(mcp_world["system"], world["system"], "{mcp_world}");
+    assert_eq!(mcp_world["type"], world["type"], "{mcp_world}");
+    assert_eq!(
+        mcp_world["compatibility"], world["compatibility"],
+        "{mcp_world}"
+    );
+    assert_eq!(
+        mcp_world["release_channel"], world["release_channel"],
+        "{mcp_world}"
+    );
 
     // A collection read.
     let (status, actors) = rest(&router, &bearer, "GET", "/api/documents/actors", None).await;
@@ -836,94 +873,158 @@ async fn the_real_instance_writes_every_embedded_kind() {
     let author = user_id(&router, &bearer).await;
 
     // The embedded kinds the instance accepts, with the parent they hang
-    // from, the collection the parent is read back from, and the parent's id.
-    let kinds: Vec<(&str, Value, &str, &str, &str)> = vec![
-        (
-            "Combatant",
-            json!([{"name":"Forgewire Combatant"}]),
-            &combat_parent,
-            "combats",
-            &combat_id,
-        ),
-        (
-            "ActiveEffect",
-            json!([{"name":"Forgewire Effect"}]),
-            &actor_parent,
-            "actors",
-            &actor_id,
-        ),
-        (
-            "Drawing",
-            json!([{"x":0,"y":0,"author":author,"shape":{"type":"rect","width":100,"height":50}}]),
-            &scene_parent,
-            "scenes",
-            &scene_id,
-        ),
-        (
-            "Note",
-            json!([{"text":"Forgewire Note","x":0,"y":0}]),
-            &scene_parent,
-            "scenes",
-            &scene_id,
-        ),
-        (
-            "Tile",
-            json!([{"x":0,"y":0,"width":100,"height":100,"text":"Forgewire Tile"}]),
-            &scene_parent,
-            "scenes",
-            &scene_id,
-        ),
-        (
-            "Token",
-            json!([{"x":0,"y":0,"name":"Forgewire Token"}]),
-            &scene_parent,
-            "scenes",
-            &scene_id,
-        ),
-        (
-            "Wall",
-            json!([{"c":[0,0,100,0],"light":0,"sight":0,"sound":0,"door":0,"move":0}]),
-            &scene_parent,
-            "scenes",
-            &scene_id,
-        ),
-        (
-            "AmbientLight",
-            json!([{"x":0,"y":0}]),
-            &scene_parent,
-            "scenes",
-            &scene_id,
-        ),
-        (
-            "AmbientSound",
-            json!([{"x":0,"y":0}]),
-            &scene_parent,
-            "scenes",
-            &scene_id,
-        ),
+    // from, the collection the parent is read back from, the parent's id,
+    // and the update the instance accepts for that kind. Each kind carries
+    // its own field: a wall has no name, and a note has text instead.
+    struct EmbeddedCase {
+        kind: &'static str,
+        data: Value,
+        parent: String,
+        parent_collection: &'static str,
+        parent_id: String,
+        update: Value,
+        field: &'static str,
+        expected: Value,
+    }
+    let kinds: Vec<EmbeddedCase> = vec![
+        EmbeddedCase {
+            kind: "Combatant",
+            data: json!([{"name":"Forgewire Combatant"}]),
+            parent: combat_parent.clone(),
+            parent_collection: "combats",
+            parent_id: combat_id.clone(),
+            update: json!({"name":"Forgewire Combatant Updated"}),
+            field: "name",
+            expected: json!("Forgewire Combatant Updated"),
+        },
+        EmbeddedCase {
+            kind: "ActiveEffect",
+            data: json!([{"name":"Forgewire Effect"}]),
+            parent: actor_parent.clone(),
+            parent_collection: "actors",
+            parent_id: actor_id.clone(),
+            update: json!({"name":"Forgewire Effect Updated"}),
+            field: "name",
+            expected: json!("Forgewire Effect Updated"),
+        },
+        EmbeddedCase {
+            kind: "Drawing",
+            data: json!([{"x":0,"y":0,"author":author,"shape":{"type":"rect","width":100,"height":50}}]),
+            parent: scene_parent.clone(),
+            parent_collection: "scenes",
+            parent_id: scene_id.clone(),
+            update: json!({"x":25}),
+            field: "x",
+            expected: json!(25),
+        },
+        EmbeddedCase {
+            kind: "Note",
+            data: json!([{"text":"Forgewire Note","x":0,"y":0}]),
+            parent: scene_parent.clone(),
+            parent_collection: "scenes",
+            parent_id: scene_id.clone(),
+            update: json!({"text":"Forgewire Note Updated"}),
+            field: "text",
+            expected: json!("Forgewire Note Updated"),
+        },
+        EmbeddedCase {
+            kind: "Tile",
+            data: json!([{"x":0,"y":0,"width":100,"height":100,"text":"Forgewire Tile"}]),
+            parent: scene_parent.clone(),
+            parent_collection: "scenes",
+            parent_id: scene_id.clone(),
+            update: json!({"x":25}),
+            field: "x",
+            expected: json!(25),
+        },
+        EmbeddedCase {
+            kind: "Token",
+            data: json!([{"x":0,"y":0,"name":"Forgewire Token"}]),
+            parent: scene_parent.clone(),
+            parent_collection: "scenes",
+            parent_id: scene_id.clone(),
+            update: json!({"name":"Forgewire Token Updated"}),
+            field: "name",
+            expected: json!("Forgewire Token Updated"),
+        },
+        EmbeddedCase {
+            kind: "Wall",
+            data: json!([{"c":[0,0,100,0],"light":0,"sight":0,"sound":0,"door":0,"move":0}]),
+            parent: scene_parent.clone(),
+            parent_collection: "scenes",
+            parent_id: scene_id.clone(),
+            // A wall's sense types are enumerated, not booleans: 0 is none,
+            // 10 limited, 20 normal.
+            update: json!({"light":10}),
+            field: "light",
+            expected: json!(10),
+        },
+        EmbeddedCase {
+            kind: "AmbientLight",
+            data: json!([{"x":0,"y":0}]),
+            parent: scene_parent.clone(),
+            parent_collection: "scenes",
+            parent_id: scene_id.clone(),
+            update: json!({"x":25}),
+            field: "x",
+            expected: json!(25),
+        },
+        EmbeddedCase {
+            kind: "AmbientSound",
+            data: json!([{"x":0,"y":0}]),
+            parent: scene_parent.clone(),
+            parent_collection: "scenes",
+            parent_id: scene_id.clone(),
+            update: json!({"x":25}),
+            field: "x",
+            expected: json!(25),
+        },
     ];
 
-    for (kind, data, parent, parent_collection, parent_id) in kinds {
+    for case in kinds {
+        let kind = case.kind;
         let (status, created) = rest(
             &router,
             &bearer,
             "POST",
             "/api/write/create_document",
-            Some(json!({"kind":kind,"data":data,"parent_uuid":parent})),
+            Some(json!({"kind":kind,"data":case.data,"parent_uuid":case.parent})),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{kind}: {created}");
         let id = created[0]["_id"].as_str().expect("a created id").to_owned();
 
         // The document hangs from its parent, so the parent holds it.
-        let parent_document = documents_in(&router, &bearer, parent_collection)
+        let parent_document = documents_in(&router, &bearer, case.parent_collection)
             .await
             .into_iter()
-            .find(|document| document["_id"] == parent_id)
+            .find(|document| document["_id"] == case.parent_id.as_str())
             .unwrap_or_else(|| panic!("{kind}: the parent was not readable"));
         assert!(
             holds_id(&parent_document, &id),
             "{kind}: the parent does not hold the created document"
+        );
+
+        // The document can be updated in place, and the parent shows it.
+        let (status, updated) = rest(
+            &router,
+            &bearer,
+            "POST",
+            "/api/write/modify_document",
+            Some(json!({"kind":kind,"id":id,"updates":[case.update],"parent_uuid":case.parent})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{kind}: {updated}");
+        let parent_document = documents_in(&router, &bearer, case.parent_collection)
+            .await
+            .into_iter()
+            .find(|document| document["_id"] == case.parent_id.as_str())
+            .unwrap_or_else(|| panic!("{kind}: the parent was not readable"));
+        let embedded_document = embedded(&parent_document, &id)
+            .unwrap_or_else(|| panic!("{kind}: the parent does not hold the updated document"));
+        assert_eq!(
+            embedded_document[case.field], case.expected,
+            "{kind}: the update is not visible in the parent"
         );
 
         let (status, deleted) = rest(
@@ -931,16 +1032,16 @@ async fn the_real_instance_writes_every_embedded_kind() {
             &bearer,
             "POST",
             "/api/write/delete_document",
-            Some(json!({"kind":kind,"ids":[id],"parent_uuid":parent})),
+            Some(json!({"kind":kind,"ids":[id],"parent_uuid":case.parent})),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{kind}: {deleted}");
 
         // And the parent no longer holds it.
-        let parent_document = documents_in(&router, &bearer, parent_collection)
+        let parent_document = documents_in(&router, &bearer, case.parent_collection)
             .await
             .into_iter()
-            .find(|document| document["_id"] == parent_id)
+            .find(|document| document["_id"] == case.parent_id.as_str())
             .unwrap_or_else(|| panic!("{kind}: the parent was not readable"));
         assert!(
             !holds_id(&parent_document, &id),
@@ -1046,7 +1147,8 @@ async fn the_real_instance_accepts_compendium_and_upload_writes() {
     );
 
     // A pack the world does not advertise is refused before it reaches the
-    // instance, whether it is named by its own name or by a pack id.
+    // instance, whether it is named by its own name or by a pack id. The
+    // refusal is a lookup miss, so it is reported as "not found".
     for requested in ["forgewire-no-such-pack", "world.forgewire-no-such-pack"] {
         let (status, refused) = rest(
             &router,
@@ -1056,7 +1158,7 @@ async fn the_real_instance_accepts_compendium_and_upload_writes() {
             None,
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{requested}: {refused}");
+        assert_eq!(status, StatusCode::NOT_FOUND, "{requested}: {refused}");
         assert!(
             refused["error"]
                 .as_str()
@@ -1130,6 +1232,132 @@ async fn the_real_instance_accepts_compendium_and_upload_writes() {
         "{refused}"
     );
     assert_eq!(refused["outcome"], "possibly_applied", "{refused}");
+}
+
+/// A compendium pack holds documents, and the gateway writes them the same
+/// way it writes world documents: create, read back, update, read back,
+/// delete, read back.
+#[tokio::test]
+async fn the_real_instance_mutates_documents_inside_a_compendium_pack() {
+    let Some((router, bearer, _world)) = gateway().await else {
+        eprintln!("skipped: FORGEWIRE_REAL_WORLD_URL is not set");
+        return;
+    };
+
+    let suffix = run_suffix();
+    let label = format!("Forgewire Pack {suffix}");
+    let (status, pack) = rest(
+        &router,
+        &bearer,
+        "POST",
+        "/api/compendiums",
+        Some(json!({"label":label,"type":"Actor"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{pack}");
+    let pack_id = pack["result"]["id"].as_str().expect("a pack id").to_owned();
+
+    // Create a document inside the pack.
+    let name = format!("Forgewire Pack Actor {suffix}");
+    let (status, created) = rest(
+        &router,
+        &bearer,
+        "POST",
+        "/api/write/create_document",
+        Some(json!({"kind":"Actor","data":[{"name":name,"type":"npc"}],"pack":pack_id})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let id = created[0]["_id"].as_str().expect("a created id").to_owned();
+
+    // It is readable in the pack.
+    let (status, documents) = rest(
+        &router,
+        &bearer,
+        "GET",
+        &format!("/api/compendiums/{pack_id}/documents/actors"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{documents}");
+    let documents = documents.as_array().cloned().unwrap_or_default();
+    assert!(
+        documents
+            .iter()
+            .any(|document| document["_id"] == id.as_str()),
+        "{documents:?}"
+    );
+
+    // Update it inside the pack.
+    let updated_name = format!("Forgewire Pack Actor Updated {suffix}");
+    let (status, updated) = rest(
+        &router,
+        &bearer,
+        "POST",
+        "/api/write/modify_document",
+        Some(json!({"kind":"Actor","id":id,"updates":[{"name":updated_name}],"pack":pack_id})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{updated}");
+
+    // The update is visible in the pack.
+    let (status, documents) = rest(
+        &router,
+        &bearer,
+        "GET",
+        &format!("/api/compendiums/{pack_id}/documents/actors"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{documents}");
+    let documents = documents.as_array().cloned().unwrap_or_default();
+    assert!(
+        documents
+            .iter()
+            .any(|document| document["_id"] == id.as_str()
+                && document["name"] == updated_name.as_str()),
+        "{documents:?}"
+    );
+
+    // Delete it from the pack.
+    let (status, deleted) = rest(
+        &router,
+        &bearer,
+        "POST",
+        "/api/write/delete_document",
+        Some(json!({"kind":"Actor","ids":[id],"pack":pack_id})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{deleted}");
+
+    // It is gone from the pack.
+    let (status, documents) = rest(
+        &router,
+        &bearer,
+        "GET",
+        &format!("/api/compendiums/{pack_id}/documents/actors"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{documents}");
+    let documents = documents.as_array().cloned().unwrap_or_default();
+    assert!(
+        !documents
+            .iter()
+            .any(|document| document["_id"] == id.as_str()),
+        "{documents:?}"
+    );
+
+    // And the pack itself is removed.
+    let (status, removed) = rest(
+        &router,
+        &bearer,
+        "DELETE",
+        &format!("/api/compendiums/{pack_id}"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{removed}");
 }
 
 #[tokio::test]
