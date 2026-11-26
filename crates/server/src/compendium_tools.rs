@@ -20,8 +20,8 @@ pub async fn call(
     policy: operations::WritePolicy,
     name: &str,
     args: &Value,
-) -> anyhow::Result<Value> {
-    Ok(operations::compendium(client, credential, policy, name, args).await?)
+) -> Result<Value, operations::OperationError> {
+    operations::compendium(client, credential, policy, name, args).await
 }
 
 #[cfg(test)]

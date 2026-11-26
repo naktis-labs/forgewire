@@ -17,9 +17,15 @@ use url::Url;
 
 pub mod compendium;
 pub mod connection;
+pub mod errors;
 pub mod files;
 pub mod read_ops;
 pub mod socket_mux;
+
+pub use errors::{
+    ambiguous_mutation, invalid_input, pack_kind_mismatch, pack_not_found, upstream_authentication,
+    AmbiguousMutation, InvalidInput, PackKindMismatch, PackNotFound, UpstreamAuthentication,
+};
 
 /// The disposable local Foundry world used by the interoperability harness.
 ///
@@ -428,73 +434,6 @@ fn write_operation(
     Ok(operation)
 }
 
-/// A change whose outcome is unknown.
-///
-/// The request may have reached Foundry, but the answer does not prove
-/// whether the change was applied: a timeout, a broken socket and an
-/// invalid acknowledgement all leave that open. The gateway reports this
-/// instead of retrying the change, so a caller learns the outcome by
-/// reading the affected document again.
-#[derive(Debug)]
-pub struct AmbiguousMutation {
-    message: String,
-}
-
-impl AmbiguousMutation {
-    /// The failure message, which states that the change may have been
-    /// applied.
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-}
-
-impl std::fmt::Display for AmbiguousMutation {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for AmbiguousMutation {}
-
-/// Mark a failure as a change whose outcome is unknown. The message is
-/// shown to the caller unchanged.
-pub fn ambiguous_mutation(message: impl Into<String>) -> anyhow::Error {
-    anyhow::Error::new(AmbiguousMutation {
-        message: message.into(),
-    })
-}
-
-/// Caller input the connector refused before it reached Foundry.
-///
-/// The request never left the gateway, so the failure is a caller mistake
-/// and not an upstream fault.
-#[derive(Debug)]
-pub struct InvalidInput {
-    message: String,
-}
-
-impl InvalidInput {
-    /// The failure message.
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-}
-
-impl std::fmt::Display for InvalidInput {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for InvalidInput {}
-
-/// Mark a failure as caller input the connector refused.
-pub fn invalid_input(message: impl Into<String>) -> anyhow::Error {
-    anyhow::Error::new(InvalidInput {
-        message: message.into(),
-    })
-}
-
 fn validate_write_ack(response: &Value, action: &str, requested: &Value) -> Result<()> {
     if response.get("action").and_then(Value::as_str) != Some(action) {
         return Err(ambiguous_mutation(
@@ -849,7 +788,7 @@ impl FoundryClient {
             return Err(if is_transient_status(status) {
                 retry_after(response.headers(), anyhow!("{message}"))
             } else {
-                connection::mark_terminal(anyhow!("{message}"))
+                connection::mark_terminal(crate::upstream_authentication(message))
             });
         }
         let session = response
@@ -900,14 +839,14 @@ impl FoundryClient {
                     anyhow!("Foundry authentication request returned transient status {status}"),
                 ));
             }
-            return Err(connection::mark_terminal(anyhow!(
-                "Foundry authentication failed (HTTP status {status})"
+            return Err(connection::mark_terminal(crate::upstream_authentication(
+                format!("Foundry authentication failed (HTTP status {status})"),
             )));
         }
         let body: Value = auth.json().await.unwrap_or(Value::Null);
         if body.get("status").and_then(Value::as_str) != Some("success") {
-            return Err(connection::mark_terminal(anyhow!(
-                "Foundry authentication failed"
+            return Err(connection::mark_terminal(crate::upstream_authentication(
+                "Foundry authentication failed",
             )));
         }
         let userid = credential.userid.ok_or_else(|| {

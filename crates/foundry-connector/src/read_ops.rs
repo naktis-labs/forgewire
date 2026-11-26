@@ -222,21 +222,24 @@ pub fn summarize_packs(packs: &Value, document_name: Option<&str>) -> Vec<Value>
         })
         .collect()
 }
-pub fn validate_pack_access(packs: &Value, id: &str, kind: &str) -> Option<String> {
+/// Check that the world advertises `id` and that the pack holds `kind`.
+///
+/// The failure is typed, so the application layer classifies it by kind and
+/// not by wording: a pack the world does not advertise is a lookup miss,
+/// and a pack that holds another document type is a caller mistake. Neither
+/// is an upstream fault.
+pub fn validate_pack_access(packs: &Value, id: &str, kind: &str) -> Result<(), anyhow::Error> {
     match packs
         .as_array()
         .into_iter()
         .flatten()
         .find(|p| p.get("id").and_then(Value::as_str) == Some(id))
     {
-        None => Some(format!(
-            "Compendium pack \"{id}\" not found. Use get_compendiums to list the available packs."
-        )),
-        Some(p) if p.get("type").and_then(Value::as_str) != Some(kind) => Some(format!(
-            "Compendium pack \"{id}\" holds {} documents, not {kind}.",
-            js_string(p.get("type"))
-        )),
-        _ => None,
+        None => Err(crate::pack_not_found(id)),
+        Some(p) if p.get("type").and_then(Value::as_str) != Some(kind) => Err(
+            crate::pack_kind_mismatch(id, js_string(p.get("type")), kind),
+        ),
+        _ => Ok(()),
     }
 }
 #[cfg(test)]
@@ -389,13 +392,32 @@ mod tests {
             summarize_packs(&p, Some("item")),
             vec![json!({"id":"world.items","label":"Items","type":"Item","packageName":"world"})]
         );
-        assert_eq!(validate_pack_access(&p, "world.items", "Item"), None);
+        assert!(validate_pack_access(&p, "world.items", "Item").is_ok());
         assert!(validate_pack_access(&p, "world.items", "Actor")
-            .unwrap()
+            .unwrap_err()
+            .to_string()
             .contains("holds Item"));
         assert!(validate_pack_access(&p, "missing", "Item")
-            .unwrap()
+            .unwrap_err()
+            .to_string()
             .contains("not found"));
+    }
+
+    /// The pack-access failures are typed, so the application layer never
+    /// has to read their wording to classify them.
+    #[test]
+    fn pack_access_failures_are_typed() {
+        let p = json!([{"id":"world.items","label":"Items","type":"Item"}]);
+        let missing = validate_pack_access(&p, "missing", "Item").unwrap_err();
+        assert!(
+            missing.downcast_ref::<crate::PackNotFound>().is_some(),
+            "{missing}"
+        );
+        let mismatch = validate_pack_access(&p, "world.items", "Actor").unwrap_err();
+        assert!(
+            mismatch.downcast_ref::<crate::PackKindMismatch>().is_some(),
+            "{mismatch}"
+        );
     }
 
     #[test]

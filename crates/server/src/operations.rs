@@ -553,6 +553,10 @@ pub enum OperationError {
     NotFound(anyhow::Error),
     /// Contacting Foundry or interpreting its response failed.
     Upstream(anyhow::Error),
+    /// The instance refused the gateway's configured credentials. The
+    /// gateway authenticated the caller; the upstream refused the gateway,
+    /// so this is an upstream fault and not a caller mistake.
+    UpstreamAuthentication(anyhow::Error),
     /// A change may have been applied. The request reached Foundry, but the
     /// answer does not prove whether the change took effect, so the caller
     /// learns the outcome by reading the affected document again. The
@@ -561,7 +565,8 @@ pub enum OperationError {
 }
 
 impl OperationError {
-    fn invalid(message: &str) -> Self {
+    /// A caller mistake: the request as stated cannot be satisfied.
+    pub fn invalid(message: &str) -> Self {
         OperationError::Invalid(anyhow!("{message}"))
     }
 }
@@ -573,6 +578,7 @@ impl std::fmt::Display for OperationError {
             | OperationError::Invalid(e)
             | OperationError::NotFound(e)
             | OperationError::Upstream(e)
+            | OperationError::UpstreamAuthentication(e)
             | OperationError::PotentiallyApplied(e) => e.fmt(f),
         }
     }
@@ -585,6 +591,7 @@ impl std::error::Error for OperationError {
             | OperationError::Invalid(e)
             | OperationError::NotFound(e)
             | OperationError::Upstream(e)
+            | OperationError::UpstreamAuthentication(e)
             | OperationError::PotentiallyApplied(e) => e.source(),
         }
     }
@@ -606,41 +613,65 @@ fn ensure_writes_allowed(policy: WritePolicy) -> Result<(), OperationError> {
     Ok(())
 }
 
-/// Classify a failure from a change.
+/// Classify a connector failure by the type it carries.
 ///
-/// A change whose outcome is unknown is its own outcome, not a plain upstream
-/// failure: the caller must learn whether the change took effect by reading
-/// the document again, and the change is never replayed. Caller input the
-/// connector refused never reached Foundry, so it is a caller mistake.
-fn classify_change_failure(error: anyhow::Error) -> OperationError {
-    if error
-        .downcast_ref::<foundry_connector::AmbiguousMutation>()
-        .is_some()
+/// The connector reports every domain failure with its own type, so the
+/// classification never reads the failure's wording: a caller mistake, a
+/// lookup miss, an upstream authentication refusal and an unknown change
+/// outcome are four different outcomes, and both transports see the same
+/// one.
+///
+/// A change whose outcome is unknown is its own outcome, not a plain
+/// upstream failure: the caller must learn whether the change took effect
+/// by reading the document again, and the change is never replayed. Caller
+/// input the connector refused never reached Foundry, so it is a caller
+/// mistake.
+fn classify_connector_failure(error: anyhow::Error, mutation: bool) -> OperationError {
+    if mutation
+        && error
+            .downcast_ref::<foundry_connector::AmbiguousMutation>()
+            .is_some()
     {
         return OperationError::PotentiallyApplied(error);
     }
     if error
-        .downcast_ref::<foundry_connector::InvalidInput>()
+        .downcast_ref::<foundry_connector::PackNotFound>()
         .is_some()
     {
+        return OperationError::NotFound(error);
+    }
+    if error
+        .downcast_ref::<foundry_connector::InvalidInput>()
+        .is_some()
+        || error
+            .downcast_ref::<foundry_connector::PackKindMismatch>()
+            .is_some()
+    {
         return OperationError::Invalid(error);
+    }
+    if error
+        .downcast_ref::<foundry_connector::UpstreamAuthentication>()
+        .is_some()
+    {
+        return OperationError::UpstreamAuthentication(error);
     }
     OperationError::Upstream(error)
 }
 
-/// Classify a failure from the shared read path's connector call. An unknown
-/// compendium pack reference is the caller's lookup miss (`NotFound`, 404 on
-/// REST), not an upstream fault; every other connector failure stays
-/// `Upstream`. The connector reports the miss as validation text from
-/// `read_ops::validate_pack_access`, so this is the one place a read turns
-/// that message into a typed outcome for both transports.
+/// Classify a failure from a change.
+fn classify_change_failure(error: anyhow::Error) -> OperationError {
+    classify_connector_failure(error, true)
+}
+
+/// Classify a failure from the shared read path's connector call.
+///
+/// An unknown compendium pack reference is the caller's lookup miss
+/// (`NotFound`, 404 on REST), a pack that holds another document type is a
+/// caller mistake (`Invalid`, 400 on REST), and every other connector
+/// failure stays `Upstream`. The connector reports each of them with its
+/// own type, so this never matches on wording.
 fn classify_read_failure(error: anyhow::Error) -> OperationError {
-    let message = error.to_string();
-    if message.starts_with("Compendium pack \"") && message.contains("not found") {
-        OperationError::NotFound(error)
-    } else {
-        OperationError::Upstream(error)
-    }
+    classify_connector_failure(error, false)
 }
 
 pub async fn read(
@@ -982,17 +1013,33 @@ mod tests {
     }
 
     #[test]
-    fn unknown_pack_references_classify_as_not_found_other_failures_upstream() {
-        let miss = anyhow!(
-            "Compendium pack \"world.missing\" not found. Use get_compendiums to list the available packs."
-        );
+    fn connector_failures_are_classified_by_type_and_never_by_wording() {
+        // A pack the world does not advertise is the caller's lookup miss.
+        let miss = foundry_connector::pack_not_found("world.missing");
         assert!(matches!(
             classify_read_failure(miss),
             OperationError::NotFound(_)
         ));
+        // A pack that holds another document type is a caller mistake: it
+        // must not surface as an upstream fault.
+        let mismatch = foundry_connector::pack_kind_mismatch("world.items", "Item", "Actor");
+        assert!(matches!(
+            classify_read_failure(mismatch),
+            OperationError::Invalid(_)
+        ));
+        // The instance refusing the gateway's credentials is an upstream
+        // authentication failure, not a caller mistake and not a transport
+        // fault.
+        let refused = foundry_connector::upstream_authentication(
+            "Foundry authentication failed (HTTP status 403)",
+        );
+        assert!(matches!(
+            classify_read_failure(refused),
+            OperationError::UpstreamAuthentication(_)
+        ));
+        // Everything else stays an upstream fault.
         for message in [
             "Timed out waiting Foundry document response",
-            "Compendium pack \"world.items\" holds Item documents, not Actor.",
             "Foundry document response must be an array",
         ] {
             let error = classify_read_failure(anyhow!("{message}"));
@@ -1001,6 +1048,25 @@ mod tests {
                 "{message} must stay upstream"
             );
         }
+    }
+
+    #[test]
+    fn an_unknown_change_outcome_is_its_own_outcome() {
+        let ambiguous = foundry_connector::ambiguous_mutation(
+            "socket disconnected; operation may have been applied",
+        );
+        assert!(matches!(
+            classify_change_failure(ambiguous),
+            OperationError::PotentiallyApplied(_)
+        ));
+        // The same failure on a read path is not an ambiguous change.
+        let ambiguous = foundry_connector::ambiguous_mutation(
+            "socket disconnected; operation may have been applied",
+        );
+        assert!(matches!(
+            classify_read_failure(ambiguous),
+            OperationError::Upstream(_)
+        ));
     }
 
     #[test]

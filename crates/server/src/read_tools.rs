@@ -52,8 +52,8 @@ pub async fn call(
     credential: &FoundryCredential,
     name: &str,
     args: &Value,
-) -> anyhow::Result<Value> {
-    Ok(operations::read(client, credential, name, args).await?)
+) -> Result<Value, operations::OperationError> {
+    operations::read(client, credential, name, args).await
 }
 
 #[cfg(test)]

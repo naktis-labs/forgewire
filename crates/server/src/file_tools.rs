@@ -20,11 +20,11 @@ pub async fn call(
     policy: operations::WritePolicy,
     name: &str,
     args: &Value,
-) -> anyhow::Result<Value> {
+) -> Result<Value, operations::OperationError> {
     match name {
-        "browse_files" => Ok(operations::browse_files(client, credential, args).await?),
-        "upload_file" => Ok(operations::upload_file(client, credential, policy, args).await?),
-        _ => anyhow::bail!("unknown file tool"),
+        "browse_files" => operations::browse_files(client, credential, args).await,
+        "upload_file" => operations::upload_file(client, credential, policy, args).await,
+        _ => Err(operations::OperationError::invalid("unknown file tool")),
     }
 }
 

@@ -51,6 +51,8 @@ enum WriteFailure {
     Refused,
     /// The connector refused the caller's input before it reached Foundry.
     Invalid,
+    /// The instance refused the gateway's configured credentials.
+    UpstreamAuthentication,
 }
 
 impl WriteFailure {
@@ -62,6 +64,9 @@ impl WriteFailure {
             ),
             WriteFailure::Refused => anyhow::anyhow!("Foundry refused the change"),
             WriteFailure::Invalid => foundry_connector::invalid_input("invalid upload target"),
+            WriteFailure::UpstreamAuthentication => foundry_connector::upstream_authentication(
+                "Foundry authentication failed (HTTP status 403)",
+            ),
         }
     }
 }
@@ -215,12 +220,12 @@ impl operations::Connector for FakeConnector {
         query: Value,
     ) -> anyhow::Result<Value> {
         self.record(format!("pack:{kind}:{pack}:{}:{query}", target.hostname));
-        // Mirror the connector's `validate_pack_access` wording so tests can
-        // assert how the application layer classifies a pack miss.
+        // Mirror the connector's `validate_pack_access` outcome so tests can
+        // assert how the application layer classifies a pack miss. The
+        // connector reports it as a typed failure, so the application layer
+        // classifies it by type and not by wording.
         if pack == "pack-missing" {
-            return Err(anyhow::anyhow!(
-                "Compendium pack \"pack-missing\" not found. Use get_compendiums to list the available packs."
-            ));
+            return Err(foundry_connector::pack_not_found("pack-missing"));
         }
         Ok(Value::Array(self.pack_actors.clone()))
     }
@@ -1213,6 +1218,77 @@ async fn a_compendium_change_with_an_unknown_outcome_is_reported_as_possibly_app
     .await;
     assert_eq!(mcp["result"]["isError"], true, "{mcp}");
     assert_eq!(mcp_error_text(&mcp), rest["error"]);
+    // MCP states the unknown outcome in a machine-readable way too, so a
+    // client can tell it apart from a change that certainly did not happen.
+    assert_eq!(
+        mcp["result"]["structuredContent"]["outcome"], "possibly_applied",
+        "{mcp}"
+    );
+    assert_eq!(
+        mcp["result"]["structuredContent"]["error"], rest["error"],
+        "{mcp}"
+    );
+}
+
+#[tokio::test]
+async fn an_outcome_that_is_not_ambiguous_carries_no_machine_readable_outcome() {
+    let (router, fake) = contract_app_with_token(true);
+    *fake.write_failure.lock().unwrap() = Some(WriteFailure::Invalid);
+
+    let (status, rest) = rest_send(
+        &router,
+        "POST",
+        "/api/write/create_document",
+        Some(json!({"kind":"Actor","data":[{"name":"New"}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{rest}");
+    assert!(rest.get("outcome").is_none(), "{rest}");
+
+    let (_, mcp) = mcp_call(
+        &router,
+        "create_document",
+        json!({"kind":"Actor","data":[{"name":"New"}]}),
+    )
+    .await;
+    assert_eq!(mcp["result"]["isError"], true, "{mcp}");
+    assert!(mcp["result"].get("structuredContent").is_none(), "{mcp}");
+}
+
+/// The instance refusing the gateway's credentials is an upstream
+/// authentication failure: it is neither a caller mistake nor an unknown
+/// change outcome, and both transports say so the same way.
+#[tokio::test]
+async fn an_upstream_authentication_refusal_is_reported_as_an_upstream_fault() {
+    let (router, fake) = contract_app_with_token(true);
+    *fake.write_failure.lock().unwrap() = Some(WriteFailure::UpstreamAuthentication);
+
+    let (status, rest) = rest_send(
+        &router,
+        "POST",
+        "/api/write/create_document",
+        Some(json!({"kind":"Actor","data":[{"name":"New"}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{rest}");
+    assert!(rest.get("outcome").is_none(), "{rest}");
+    assert!(
+        rest["error"]
+            .as_str()
+            .unwrap()
+            .contains("Foundry authentication failed"),
+        "{rest}"
+    );
+
+    let (_, mcp) = mcp_call(
+        &router,
+        "create_document",
+        json!({"kind":"Actor","data":[{"name":"New"}]}),
+    )
+    .await;
+    assert_eq!(mcp["result"]["isError"], true, "{mcp}");
+    assert_eq!(mcp_error_text(&mcp), rest["error"], "{mcp}");
+    assert!(mcp["result"].get("structuredContent").is_none(), "{mcp}");
 }
 
 #[tokio::test]

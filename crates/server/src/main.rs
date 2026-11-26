@@ -16,6 +16,13 @@ mod file_tools;
 mod instances;
 mod operations;
 mod read_tools;
+mod targeting;
+
+/// The refusal for a request whose credential is not issued for the instance
+/// it targets. The credential itself was valid, so this is an authorization
+/// failure rather than an authentication one.
+pub(crate) const OUT_OF_SCOPE: &str =
+    "the presented credential is not authorized for the requested Foundry instance";
 
 #[cfg(test)]
 mod auth_tests;
@@ -40,25 +47,6 @@ struct App {
     allow_writes: bool,
 }
 
-/// The refusal for a request whose credential is not issued for the instance
-/// it targets. The credential itself was valid, so this is an authorization
-/// failure rather than an authentication one.
-const OUT_OF_SCOPE: &str =
-    "the presented credential is not authorized for the requested Foundry instance";
-
-impl App {
-    /// The write gate for one request: the operator's opt-in plus this
-    /// request's own authentication. Both transports build it the same way,
-    /// so a write is never reachable through one of them alone.
-    fn write_policy(&self, authentication: &auth::Authentication) -> operations::WritePolicy {
-        if authentication.is_authenticated() {
-            operations::WritePolicy::authenticated(self.allow_writes)
-        } else {
-            operations::WritePolicy::unauthenticated(self.allow_writes)
-        }
-    }
-}
-
 /// Resolve a REST request's Foundry target: `?instance=<id|item_order>` when
 /// given, else the documented stable default — the first configured entry.
 ///
@@ -75,43 +63,49 @@ fn rest_target(
     query: &HashMap<String, String>,
     authentication: &auth::Authentication,
 ) -> Result<FoundryCredential, (StatusCode, Json<Value>)> {
-    match query.get("instance") {
-        Some(reference) => {
-            let index = instances
-                .resolve_reference(reference)
-                .map_err(|e| rest_error(StatusCode::BAD_REQUEST, e))?;
-            let index = authorized_instance(instances, index, authentication)
-                .map_err(|e| rest_error(StatusCode::FORBIDDEN, e))?;
-            instances
-                .credential(index)
-                .map_err(|e| rest_error(StatusCode::BAD_REQUEST, e))
+    let requested = match query.get("instance") {
+        Some(reference) => targeting::RequestedTarget::Reference(reference),
+        None => targeting::RequestedTarget::Default,
+    };
+    targeting::resolve(instances, requested, authentication).map_err(target_status)
+}
+
+/// Map a target failure to its REST status: a reference that names no
+/// configured instance is a bad request, and a target the credential is not
+/// issued for is forbidden.
+fn target_status(error: targeting::TargetError) -> (StatusCode, Json<Value>) {
+    let status = match &error {
+        targeting::TargetError::Unknown(_) => StatusCode::BAD_REQUEST,
+        targeting::TargetError::OutOfScope => StatusCode::FORBIDDEN,
+    };
+    rest_error(status, error)
+}
+
+/// The MCP view of a target failure: a target the credential is not issued
+/// for is forbidden, and a reference that names no configured instance is a
+/// caller mistake. The wording is the same one REST shows.
+fn target_error(error: targeting::TargetError) -> operations::OperationError {
+    let message = error.message();
+    match error {
+        targeting::TargetError::OutOfScope => {
+            operations::OperationError::Forbidden(anyhow::anyhow!("{message}"))
         }
-        None => {
-            // The stable default is the first configured entry, and it is
-            // checked against the credential's scope like any other target.
-            authorized_instance(instances, 0, authentication)
-                .map_err(|e| rest_error(StatusCode::FORBIDDEN, e))?;
-            Ok(instances.default_snapshot())
+        targeting::TargetError::Unknown(_) => {
+            operations::OperationError::Invalid(anyhow::anyhow!("{message}"))
         }
     }
 }
 
-/// Check a resolved instance against the request's credential.
-///
-/// With no token configured there is no scope to check, and the local
-/// posture is unchanged. With a token configured the credential is issued
-/// for exactly one instance, so any other instance is refused before the
-/// connector is reached.
-fn authorized_instance(
-    instances: &instances::Instances,
-    index: usize,
-    authentication: &auth::Authentication,
-) -> anyhow::Result<usize> {
-    match authentication.scope() {
-        Some(scope) if !instances.matches_scope(index, scope)? => {
-            anyhow::bail!("{OUT_OF_SCOPE}")
+impl App {
+    /// The write gate for one request: the operator's opt-in plus this
+    /// request's own authentication. Both transports build it the same way,
+    /// so a write is never reachable through one of them alone.
+    fn write_policy(&self, authentication: &auth::Authentication) -> operations::WritePolicy {
+        if authentication.is_authenticated() {
+            operations::WritePolicy::authenticated(self.allow_writes)
+        } else {
+            operations::WritePolicy::unauthenticated(self.allow_writes)
         }
-        _ => Ok(index),
     }
 }
 
@@ -160,6 +154,7 @@ fn operation_status(error: operations::OperationError) -> (StatusCode, Json<Valu
         operations::OperationError::NotFound(_) => StatusCode::NOT_FOUND,
         operations::OperationError::Forbidden(_) => StatusCode::FORBIDDEN,
         operations::OperationError::Upstream(_) => StatusCode::BAD_GATEWAY,
+        operations::OperationError::UpstreamAuthentication(_) => StatusCode::BAD_GATEWAY,
         operations::OperationError::PotentiallyApplied(_) => StatusCode::BAD_GATEWAY,
     };
     match error {
@@ -281,8 +276,7 @@ async fn rest_instances(
                 .instances
                 .resolve_reference(reference)
                 .map_err(|e| rest_error(StatusCode::BAD_REQUEST, e))?;
-            authorized_instance(&app.instances, index, &authentication)
-                .map_err(|e| rest_error(StatusCode::FORBIDDEN, e))?
+            targeting::authorize(&app.instances, index, &authentication).map_err(target_status)?
         }
         None => active_instance(&app.instances, &authentication)
             .map_err(|e| rest_error(StatusCode::BAD_REQUEST, e))?,
@@ -632,55 +626,44 @@ async fn mcp(
                     Ok(app.instances.show(index))
                 }
                 "choose_foundry_instance" => match &session {
-                    Some(id) => app.instances.resolve_selection(args).and_then(|index| {
-                        // A credential is issued for exactly one instance: a
-                        // selection outside its scope is refused before it is
-                        // recorded, so the session keeps its previous target.
-                        let index = authorized_instance(
-                            &app.instances,
-                            index,
-                            &authentication,
-                        )?;
-                        // `select` re-checks liveness under the lock that
-                        // records the choice: a session evicted after this
-                        // request's own session check (a concurrent
-                        // initialize filling the table) must surface as an
-                        // error instead of a phantom `selected: true`.
-                        if app.selections.select(id, index) {
-                            Ok(instances::selection_report(index))
-                        } else {
-                            Err(anyhow::anyhow!(
-                                "unknown or expired MCP session; initialize again"
-                            ))
-                        }
-                    }),
-                    None => Err(anyhow::anyhow!(
-                        "choose_foundry_instance requires an MCP session: initialize first and send the returned Mcp-Session-Id header"
+                    Some(id) => mcp_selection(&app, id, args, &authentication),
+                    None => Err(operations::OperationError::invalid(
+                        "choose_foundry_instance requires an MCP session: initialize first and send the returned Mcp-Session-Id header",
                     )),
                 },
                 _ => {
-                    // The target is checked against the credential's scope
-                    // here as well as at selection time: a target outside the
-                    // scope never reaches the connector.
-                    let index = selected.unwrap_or(0);
-                    let credential = authorized_instance(
-                        &app.instances,
-                        index,
-                        &authentication,
-                    )
-                    .and_then(|index| app.instances.credential(index));
-                    match credential {
+                    // The target is resolved and authorized through the same
+                    // path REST uses, so a target outside the credential's
+                    // scope never reaches the connector on either transport.
+                    let requested = match selected {
+                        Some(index) => targeting::RequestedTarget::Selected(index),
+                        None => targeting::RequestedTarget::Default,
+                    };
+                    match targeting::resolve(&app.instances, requested, &authentication) {
                         Ok(credential) => {
                             dispatch_tool(&app, &credential, policy, name, args).await
                         }
-                        Err(err) => Err(err),
+                        Err(error) => Err(target_error(error)),
                     }
                 }
             };
             match result {
                 Ok(value) => tool_success(id, value),
                 Err(err) => {
-                    json!({"jsonrpc":"2.0","id":id,"result":{"content":[{"type":"text","text":err.to_string()}],"isError":true}})
+                    // A change whose outcome is unknown is marked in a
+                    // machine-readable way, exactly as the REST envelope
+                    // marks it: the caller learns that it must read the
+                    // affected document again, and that the change was not
+                    // replayed.
+                    let mut envelope =
+                        json!({"content":[{"type":"text","text":err.to_string()}],"isError":true});
+                    if matches!(err, operations::OperationError::PotentiallyApplied(_)) {
+                        envelope["structuredContent"] = json!({
+                            "outcome": "possibly_applied",
+                            "error": err.to_string(),
+                        });
+                    }
+                    json!({"jsonrpc":"2.0","id":id,"result":envelope})
                 }
             }
         }
@@ -700,30 +683,61 @@ async fn mcp(
     response
 }
 
+/// Record an MCP session's instance selection.
+///
+/// The reference is resolved first, then checked against the credential's
+/// scope: a credential is issued for exactly one instance, so a selection
+/// outside its scope is refused before it is recorded and the session keeps
+/// its previous target. `select` then re-checks liveness under the lock that
+/// records the choice: a session evicted after this request's own session
+/// check (a concurrent initialize filling the table) must surface as an
+/// error instead of a phantom `selected: true`.
+fn mcp_selection(
+    app: &App,
+    session: &str,
+    args: &Value,
+    authentication: &auth::Authentication,
+) -> Result<Value, operations::OperationError> {
+    let index = app
+        .instances
+        .resolve_selection(args)
+        .map_err(operations::OperationError::Invalid)?;
+    let index =
+        targeting::authorize(&app.instances, index, authentication).map_err(target_error)?;
+    if app.selections.select(session, index) {
+        Ok(instances::selection_report(index))
+    } else {
+        Err(operations::OperationError::invalid(
+            "unknown or expired MCP session; initialize again",
+        ))
+    }
+}
+
 /// Route a non-selection MCP tool to the shared application operations using
 /// the caller's own target snapshot.
+///
+/// The typed application error travels back unchanged: the MCP envelope
+/// renders its message and marks an unknown change outcome in a
+/// machine-readable way, exactly as the REST envelope does.
 async fn dispatch_tool(
     app: &App,
     credential: &FoundryCredential,
     policy: operations::WritePolicy,
     name: &str,
     args: &Value,
-) -> anyhow::Result<Value> {
+) -> Result<Value, operations::OperationError> {
     match name {
-        "get_world" => operations::world(&*app.client, credential)
+        "get_world" => operations::world(&*app.client, credential).await,
+        "list_documents" => {
+            operations::collection(
+                &*app.client,
+                credential,
+                args.get("collection").and_then(Value::as_str).unwrap_or(""),
+            )
             .await
-            .map_err(anyhow::Error::from),
-        "list_documents" => operations::collection(
-            &*app.client,
-            credential,
-            args.get("collection").and_then(Value::as_str).unwrap_or(""),
-        )
-        .await
-        .map_err(anyhow::Error::from),
+        }
         "create_document" | "modify_document" | "delete_document" => {
-            operations::write_document(&*app.client, credential, policy, name, args)
-                .await
-                .map_err(anyhow::Error::from)
+            operations::write_document(&*app.client, credential, policy, name, args).await
         }
         _ if file_tools::recognizes(name) => {
             file_tools::call(&*app.client, credential, policy, name, args).await
@@ -734,7 +748,7 @@ async fn dispatch_tool(
         _ if read_tools::recognizes(name) => {
             read_tools::call(&*app.client, credential, name, args).await
         }
-        _ => Err(anyhow::anyhow!("unknown tool")),
+        _ => Err(operations::OperationError::invalid("unknown tool")),
     }
 }
 
