@@ -33,7 +33,33 @@ struct FakeConnector {
     listing: Value,
     upload_result: Value,
     write_result: Value,
+    /// How a change fails, when the test asks for a failure.
+    write_failure: Mutex<Option<WriteFailure>>,
     calls: Mutex<Vec<String>>,
+}
+
+/// How the fake connector fails a change.
+#[derive(Clone, Copy)]
+enum WriteFailure {
+    /// The change may have been applied: the outcome is unknown.
+    Ambiguous,
+    /// The change certainly did not happen.
+    Refused,
+    /// The connector refused the caller's input before it reached Foundry.
+    Invalid,
+}
+
+impl WriteFailure {
+    /// The error the fake connector reports for this failure.
+    fn error(self) -> anyhow::Error {
+        match self {
+            WriteFailure::Ambiguous => foundry_connector::ambiguous_mutation(
+                "Foundry document request failed: denied, and the operation may have been applied",
+            ),
+            WriteFailure::Refused => anyhow::anyhow!("Foundry refused the change"),
+            WriteFailure::Invalid => foundry_connector::invalid_input("invalid upload target"),
+        }
+    }
 }
 
 impl FakeConnector {
@@ -52,12 +78,21 @@ impl FakeConnector {
             listing: json!({"target": "data/", "dirs": ["data/audio"], "files": [{"name": "song.mp3", "size": 100}]}),
             upload_result: json!({"path": "data/upload/song.mp3"}),
             write_result: json!([{"_id": "new-1"}]),
+            write_failure: Mutex::new(None),
             calls: Mutex::new(Vec::new()),
         }
     }
 
     fn record(&self, entry: String) {
         self.calls.lock().unwrap().push(entry);
+    }
+
+    /// The failure a change reports, when the test asked for one.
+    fn change_failure(&self) -> Option<anyhow::Error> {
+        self.write_failure
+            .lock()
+            .unwrap()
+            .map(|failure| failure.error())
     }
 
     fn recorded(&self) -> Vec<String> {
@@ -169,6 +204,9 @@ impl operations::Connector for FakeConnector {
             "create_compendium:{}:{label}:{kind}",
             target.hostname
         ));
+        if let Some(error) = self.change_failure() {
+            return Err(error);
+        }
         Ok(json!({"name": "pack-new", "label": label, "type": kind}))
     }
 
@@ -178,6 +216,9 @@ impl operations::Connector for FakeConnector {
         name: &str,
     ) -> anyhow::Result<Value> {
         self.record(format!("delete_compendium:{}:{name}", target.hostname));
+        if let Some(error) = self.change_failure() {
+            return Err(error);
+        }
         Ok(json!({"deleted": name}))
     }
 
@@ -209,6 +250,9 @@ impl operations::Connector for FakeConnector {
             target.hostname,
             data.len()
         ));
+        if let Some(error) = self.change_failure() {
+            return Err(error);
+        }
         Ok(self.upload_result.clone())
     }
 
@@ -225,6 +269,9 @@ impl operations::Connector for FakeConnector {
             target.hostname,
             serde_json::to_string(&data).unwrap()
         ));
+        if let Some(error) = self.change_failure() {
+            return Err(error);
+        }
         Ok(self.write_result.clone())
     }
 
@@ -242,6 +289,9 @@ impl operations::Connector for FakeConnector {
             target.hostname,
             serde_json::to_string(&data).unwrap()
         ));
+        if let Some(error) = self.change_failure() {
+            return Err(error);
+        }
         Ok(self.write_result.clone())
     }
 
@@ -257,6 +307,9 @@ impl operations::Connector for FakeConnector {
             "delete:{kind}:{}:{ids:?}:{parent:?}:{pack:?}",
             target.hostname
         ));
+        if let Some(error) = self.change_failure() {
+            return Err(error);
+        }
         Ok(self.write_result.clone())
     }
 }
@@ -1044,6 +1097,116 @@ async fn rest_and_mcp_document_writes_share_gating_validation_and_effects() {
         "data must be a non-empty array of objects"
     );
     assert_eq!(fake.recorded().len(), before);
+}
+
+#[tokio::test]
+async fn a_change_with_an_unknown_outcome_is_reported_as_possibly_applied() {
+    let (router, fake) = contract_app_with_token(true);
+    *fake.write_failure.lock().unwrap() = Some(WriteFailure::Ambiguous);
+
+    let (status, rest) = rest_send(
+        &router,
+        "POST",
+        "/api/write/create_document",
+        Some(json!({"kind":"Actor","data":[{"name":"New"}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(rest["outcome"], "possibly_applied");
+    assert!(
+        rest["error"]
+            .as_str()
+            .unwrap()
+            .contains("may have been applied"),
+        "{rest}"
+    );
+
+    let (_, mcp) = mcp_call(
+        &router,
+        "create_document",
+        json!({"kind":"Actor","data":[{"name":"New"}]}),
+    )
+    .await;
+    assert_eq!(mcp["result"]["isError"], true);
+    assert!(
+        mcp_error_text(&mcp).contains("may have been applied"),
+        "{mcp}"
+    );
+
+    // A change that certainly did not happen is not marked as possibly
+    // applied.
+    *fake.write_failure.lock().unwrap() = Some(WriteFailure::Refused);
+    let (status, rest) = rest_send(
+        &router,
+        "POST",
+        "/api/write/create_document",
+        Some(json!({"kind":"Actor","data":[{"name":"New"}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(rest.get("outcome").is_none(), "{rest}");
+}
+
+#[tokio::test]
+async fn a_compendium_change_with_an_unknown_outcome_is_reported_as_possibly_applied() {
+    let (router, fake) = contract_app_with_token(true);
+    *fake.write_failure.lock().unwrap() = Some(WriteFailure::Ambiguous);
+
+    let (status, rest) = rest_send(
+        &router,
+        "POST",
+        "/api/compendiums",
+        Some(json!({"label":"Pack","type":"Actor"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(rest["outcome"], "possibly_applied", "{rest}");
+    assert!(
+        rest["error"]
+            .as_str()
+            .unwrap()
+            .contains("may have been applied"),
+        "{rest}"
+    );
+
+    let (status, deleted) = rest_send(&router, "DELETE", "/api/compendiums/pack-core", None).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert_eq!(deleted["outcome"], "possibly_applied", "{deleted}");
+
+    // MCP reports the same outcome for the same change.
+    let (_, mcp) = mcp_call(
+        &router,
+        "create_compendium",
+        json!({"label":"Pack","type":"Actor"}),
+    )
+    .await;
+    assert_eq!(mcp["result"]["isError"], true, "{mcp}");
+    assert_eq!(mcp_error_text(&mcp), rest["error"]);
+}
+
+#[tokio::test]
+async fn a_change_refused_before_it_reaches_foundry_is_a_caller_mistake() {
+    let (router, fake) = contract_app_with_token(true);
+    *fake.write_failure.lock().unwrap() = Some(WriteFailure::Invalid);
+
+    let (status, rest) = rest_send(
+        &router,
+        "POST",
+        "/api/write/create_document",
+        Some(json!({"kind":"Actor","data":[{"name":"New"}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{rest}");
+    assert!(rest.get("outcome").is_none(), "{rest}");
+
+    let (_, mcp) = mcp_call(
+        &router,
+        "create_document",
+        json!({"kind":"Actor","data":[{"name":"New"}]}),
+    )
+    .await;
+    assert_eq!(mcp["result"]["isError"], true, "{mcp}");
+    assert_eq!(mcp_error_text(&mcp), rest["error"]);
 }
 
 #[tokio::test]

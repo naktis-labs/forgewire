@@ -14,6 +14,26 @@ pub enum Request {
         action: String,
         operation: Value,
     },
+    Compendium {
+        action: String,
+        data: Value,
+    },
+    Files {
+        target: String,
+        kind: String,
+        extensions: Vec<String>,
+    },
+}
+
+/// What a pending request expects its acknowledgement to contain. The
+/// acknowledgement id already identifies the request, so the expectation only
+/// decides whether a reply carrying that id is the answer or a frame that
+/// must be left unclaimed.
+#[derive(Clone, Debug)]
+enum Expectation {
+    Document { document: String, action: String },
+    Compendium { action: String },
+    Files,
 }
 
 struct State {
@@ -23,14 +43,46 @@ struct State {
     events: VecDeque<String>,
     disconnected: bool,
 }
+/// Why a pending request failed.
+///
+/// The distinction decides the fate of the shared connection: the upstream
+/// answered and refused the request, so the connection stays usable for
+/// other requests; the transport failed, so the connection cannot carry
+/// another request and is invalidated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RequestError {
+    /// The upstream answered. The connection is healthy and stays in use.
+    Answer(String),
+    /// The transport failed. The connection cannot carry another request.
+    Transport(String),
+}
+
+impl std::fmt::Display for RequestError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.message())
+    }
+}
+
+impl RequestError {
+    /// The failure message, whichever kind of failure it is.
+    pub fn message(&self) -> &str {
+        match self {
+            RequestError::Answer(message) | RequestError::Transport(message) => message,
+        }
+    }
+    /// Whether the failure leaves the connection unusable.
+    pub fn is_transport(&self) -> bool {
+        matches!(self, RequestError::Transport(_))
+    }
+}
+
 struct Pending {
-    tx: oneshot::Sender<Result<Value, String>>,
+    tx: oneshot::Sender<Result<Value, RequestError>>,
     mutation: bool,
-    document: String,
-    action: String,
+    expectation: Expectation,
 }
 struct WorldPending {
-    tx: oneshot::Sender<Result<Value, String>>,
+    tx: oneshot::Sender<Result<Value, RequestError>>,
     sent: bool,
 }
 struct Inner {
@@ -44,7 +96,7 @@ struct Inner {
 pub struct SocketMux(Arc<Inner>);
 pub struct PendingRequest {
     id: u64,
-    rx: Option<oneshot::Receiver<Result<Value, String>>>,
+    rx: Option<oneshot::Receiver<Result<Value, RequestError>>>,
     inner: Weak<Inner>,
 }
 
@@ -97,20 +149,42 @@ impl SocketMux {
                     "42{id}{}",
                     json!(["modifyDocument", {"type":document,"action":action,"operation":operation}])
                 );
-                (frame, Some((document, action)))
+                let mutation = action != "get";
+                (
+                    frame,
+                    Some((Expectation::Document { document, action }, mutation)),
+                )
+            }
+            Request::Compendium { action, data } => {
+                let mut operation = json!({"action":action, "data":data});
+                if action == "create" {
+                    operation["options"] = json!({});
+                }
+                let frame = format!("42{id}{}", json!(["manageCompendium", operation]));
+                (frame, Some((Expectation::Compendium { action }, true)))
+            }
+            Request::Files {
+                target,
+                kind,
+                extensions,
+            } => {
+                let frame = format!(
+                    "42{id}{}",
+                    json!(["manageFiles", {"action":"browseFiles", "storage":"data", "target":target}, {"type":kind, "extensions":extensions, "wildcard":false, "render":true}])
+                );
+                (frame, Some((Expectation::Files, false)))
             }
         };
         if world_request {
             state.world = Some(WorldPending { tx, sent: false });
         } else {
-            let (document, action) = pending.unwrap();
+            let (expectation, mutation) = pending.unwrap();
             state.pending.insert(
                 id,
                 Pending {
                     tx,
-                    mutation: action != "get",
-                    document,
-                    action,
+                    mutation,
+                    expectation,
                 },
             );
         }
@@ -135,7 +209,7 @@ impl SocketMux {
                 .ok()
                 .and_then(|values| values.get(0).cloned())
                 .filter(Value::is_object)
-                .ok_or_else(|| "invalid Foundry world response".to_owned());
+                .ok_or_else(|| RequestError::Answer("invalid Foundry world response".to_owned()));
             let mut state = self.0.state.lock().unwrap();
             if let Some(world) = state.world.take() {
                 let _ = world.tx.send(payload);
@@ -147,43 +221,32 @@ impl SocketMux {
             }
             return false;
         }
-        let Some((id, response)) = parse_ack(frame) else {
+        let Some(id) = parse_ack_id(frame) else {
             self.event(frame);
             return false;
         };
         let mut state = self.0.state.lock().unwrap();
-        if let Some(pending) = state.pending.get(&id) {
-            let actual_type = response.get("type").and_then(Value::as_str);
-            let has_error = response.get("error").is_some_and(|error| !error.is_null());
-            let matches_document = {
-                (actual_type == Some(&pending.document) || (actual_type.is_none() && has_error))
-                    && response
-                        .get("action")
-                        .and_then(Value::as_str)
-                        .is_none_or(|action| action == pending.action)
-            };
-            if matches_document {
-                let pending = state.pending.remove(&id).unwrap();
-                let result = if has_error {
-                    let message = response["error"]
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown error");
-                    Err(if pending.mutation {
-                        format!("Foundry document request failed: {message}, and the operation may have been applied")
-                    } else {
-                        format!("Foundry document request failed: {message}")
-                    })
-                } else {
-                    Ok(response)
-                };
-                let _ = pending.tx.send(result);
-            } else {
-                push_event(&mut state.events, frame, self.0.max_events);
-            }
-        } else {
+        if !state.pending.contains_key(&id) {
+            // The answer belongs to a request that is no longer pending.
             push_event(&mut state.events, frame, self.0.max_events);
+            return false;
         }
+        let Some(response) = parse_ack(frame) else {
+            // The frame carries this request's id but cannot be read as an
+            // answer. The socket answered, so it stays usable; this request
+            // fails instead of waiting for an answer that will not come.
+            let pending = state.pending.remove(&id).unwrap();
+            let _ = pending.tx.send(Err(RequestError::Answer(
+                "invalid Foundry acknowledgement".to_owned(),
+            )));
+            return false;
+        };
+        let result = {
+            let pending = state.pending.get(&id).unwrap();
+            evaluate(pending, &response, frame.len())
+        };
+        let pending = state.pending.remove(&id).unwrap();
+        let _ = pending.tx.send(result);
         false
     }
     pub fn event(&self, frame: &str) {
@@ -221,7 +284,9 @@ impl SocketMux {
         let mut state = self.0.state.lock().unwrap();
         state.disconnected = true;
         if let Some(world) = state.world.take() {
-            let _ = world.tx.send(Err("socket disconnected".into()));
+            let _ = world
+                .tx
+                .send(Err(RequestError::Transport("socket disconnected".into())));
         }
         state.world_quarantined = false;
         for (_, pending) in state.pending.drain() {
@@ -230,7 +295,109 @@ impl SocketMux {
             } else {
                 "socket disconnected"
             };
-            let _ = pending.tx.send(Err(message.into()));
+            let _ = pending
+                .tx
+                .send(Err(RequestError::Transport(message.into())));
+        }
+    }
+}
+
+/// Decide what the acknowledgement for a pending request means.
+///
+/// The acknowledgement id is unique per pending request, so an id that
+/// matches is that request's answer. The expectations add the protocol shape
+/// checks the reference performs on the reply, and the ambiguity wording a
+/// mutation must carry when it fails. An answer that does not fit the
+/// request fails it: the socket answered, so it stays usable.
+fn evaluate(pending: &Pending, response: &Value, frame_len: usize) -> Result<Value, RequestError> {
+    match &pending.expectation {
+        Expectation::Document { document, action } => {
+            let actual_type = response.get("type").and_then(Value::as_str);
+            let has_error = response.get("error").is_some_and(|error| !error.is_null());
+            let matches_document = {
+                (actual_type == Some(document.as_str()) || (actual_type.is_none() && has_error))
+                    && response
+                        .get("action")
+                        .and_then(Value::as_str)
+                        .is_none_or(|value| value == action)
+            };
+            if !matches_document {
+                return Err(RequestError::Answer(if pending.mutation {
+                    format!(
+                        "Foundry document response does not answer the {document} {action} request, and the operation may have been applied"
+                    )
+                } else {
+                    format!(
+                        "Foundry document response does not answer the {document} {action} request"
+                    )
+                }));
+            }
+            if has_error {
+                let message = response["error"]
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown error");
+                return Err(RequestError::Answer(if pending.mutation {
+                    format!(
+                        "Foundry document request failed: {message}, and the operation may have been applied"
+                    )
+                } else {
+                    format!("Foundry document request failed: {message}")
+                }));
+            }
+            Ok(response.clone())
+        }
+        Expectation::Compendium { action } => {
+            let ambiguous =
+                "Invalid Foundry compendium response; the operation may have been applied"
+                    .to_owned();
+            if response.pointer("/request/action").and_then(Value::as_str) != Some(action.as_str())
+            {
+                return Err(RequestError::Answer(ambiguous));
+            }
+            if let Some(error) = response.get("error").filter(|value| !value.is_null()) {
+                let message = error
+                    .as_str()
+                    .or_else(|| error.get("message").and_then(Value::as_str))
+                    .unwrap_or("unknown error");
+                return Err(RequestError::Answer(format!(
+                    "Foundry compendium {action} failed: {message}; the operation may have been applied"
+                )));
+            }
+            let result = response.get("result");
+            let valid = if action == "create" {
+                result.is_some_and(|value| {
+                    value.is_object() && value.as_object().is_some_and(|map| !map.is_empty())
+                })
+            } else {
+                result
+                    .is_some_and(|value| value.as_str().is_some_and(|text| !text.trim().is_empty()))
+            };
+            if !valid {
+                return Err(RequestError::Answer(ambiguous));
+            }
+            Ok(response.clone())
+        }
+        Expectation::Files => {
+            if frame_len > crate::files::MAX_RESPONSE_BYTES {
+                return Err(RequestError::Answer(
+                    "Foundry browse response too large".to_owned(),
+                ));
+            }
+            if let Some(error) = response
+                .get("error")
+                .filter(|value| !value.is_null() && *value != &json!(false))
+            {
+                return Err(RequestError::Answer(format!(
+                    "Foundry browse failed: {error}"
+                )));
+            }
+            if !response.get("dirs").is_some_and(Value::is_array) {
+                return Err(RequestError::Answer(
+                    "invalid Foundry browse response".to_owned(),
+                ));
+            }
+            Ok(response.clone())
         }
     }
 }
@@ -239,12 +406,12 @@ impl PendingRequest {
     pub fn id(&self) -> u64 {
         self.id
     }
-    pub async fn wait(mut self) -> Result<Value, String> {
+    pub async fn wait(mut self) -> Result<Value, RequestError> {
         self.rx
             .take()
             .unwrap()
             .await
-            .unwrap_or_else(|_| Err("request cancelled".into()))
+            .unwrap_or_else(|_| Err(RequestError::Answer("request cancelled".into())))
     }
 }
 impl Drop for PendingRequest {
@@ -296,7 +463,9 @@ fn next_id(inner: &Inner, state: &State) -> Result<u64, String> {
 pub fn pong_for_ping(frame: &str) -> Option<&'static str> {
     (frame == "2").then_some("3")
 }
-fn parse_ack(frame: &str) -> Option<(u64, Value)> {
+/// The acknowledgement id of a Socket.IO acknowledgement frame
+/// (`43<id>[...]`), or None when the frame carries none.
+fn parse_ack_id(frame: &str) -> Option<u64> {
     let tail = frame.strip_prefix("43")?;
     let end = tail.find('[')?;
     let digits = &tail[..end];
@@ -304,9 +473,15 @@ fn parse_ack(frame: &str) -> Option<(u64, Value)> {
     if digits != id.to_string() {
         return None;
     }
+    Some(id)
+}
+
+/// The answer carried by an acknowledgement frame.
+fn parse_ack(frame: &str) -> Option<Value> {
+    let tail = frame.strip_prefix("43")?;
+    let end = tail.find('[')?;
     let values: Value = serde_json::from_str(&tail[end..]).ok()?;
-    let value = values.get(0)?.clone();
-    Some((id, value))
+    Some(values.get(0)?.clone())
 }
 
 #[cfg(test)]
@@ -388,7 +563,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wrong_document_type_or_action_does_not_consume_ack_slot() {
+    async fn an_answer_with_a_foreign_id_does_not_consume_the_pending_slot() {
+        let mux = SocketMux::new(2, 2);
+        let (pending, _) = mux
+            .begin(Request::Document {
+                document: "Actor".into(),
+                action: "update".into(),
+                operation: json!({}),
+            })
+            .unwrap();
+        let id = pending.id();
+        mux.receive(&format!(
+            "43{}[{{\"type\":\"Actor\",\"action\":\"update\",\"result\":[]}}]",
+            id + 1000
+        ));
+        assert_eq!(mux.pending_count(), 1);
+        mux.receive(&format!(
+            "43{id}[{{\"type\":\"Actor\",\"action\":\"update\",\"result\":[]}}]"
+        ));
+        assert_eq!(pending.wait().await.unwrap()["action"], "update");
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_does_not_fit_the_request_fails_it_instead_of_waiting() {
         let mux = SocketMux::new(2, 2);
         let (pending, _) = mux
             .begin(Request::Document {
@@ -401,14 +598,33 @@ mod tests {
         mux.receive(&format!(
             "43{id}[{{\"type\":\"Item\",\"action\":\"update\",\"result\":[]}}]"
         ));
-        mux.receive(&format!(
-            "43{id}[{{\"type\":\"Actor\",\"action\":\"delete\",\"result\":[]}}]"
-        ));
-        assert_eq!(mux.pending_count(), 1);
-        mux.receive(&format!(
-            "43{id}[{{\"type\":\"Actor\",\"action\":\"update\",\"result\":[]}}]"
-        ));
-        assert_eq!(pending.wait().await.unwrap()["action"], "update");
+        assert_eq!(mux.pending_count(), 0, "the request stayed pending");
+        let error = pending.wait().await.unwrap_err();
+        assert!(
+            error.message().contains("does not answer"),
+            "{}",
+            error.message()
+        );
+        assert!(error.message().contains("may have been applied"));
+    }
+
+    #[tokio::test]
+    async fn a_malformed_answer_with_a_matching_id_fails_the_request() {
+        let mux = SocketMux::new(2, 2);
+        let (pending, _) = mux
+            .begin(Request::Document {
+                document: "Actor".into(),
+                action: "get".into(),
+                operation: json!({}),
+            })
+            .unwrap();
+        let id = pending.id();
+        mux.receive(&format!("43{id}[not-json]"));
+        assert_eq!(mux.pending_count(), 0, "the request stayed pending");
+        assert_eq!(
+            pending.wait().await.unwrap_err().message(),
+            "invalid Foundry acknowledgement"
+        );
     }
 
     #[tokio::test]
@@ -451,6 +667,7 @@ mod tests {
             .wait()
             .await
             .unwrap_err()
+            .message()
             .contains("may have been applied"));
     }
 
@@ -484,6 +701,7 @@ mod tests {
             pending.id()
         ));
         let error = pending.wait().await.unwrap_err();
+        let error = error.message().to_owned();
         assert!(error.contains("denied"), "{error}");
         assert!(error.contains("may have been applied"), "{error}");
     }
@@ -516,6 +734,7 @@ mod tests {
                 .wait()
                 .await
                 .unwrap_err()
+                .message()
                 .contains("may have been applied"));
             assert!(mux.begin(Request::World).is_err());
         }
@@ -533,7 +752,242 @@ mod tests {
             .unwrap();
         mux.disconnect();
         let error = write.wait().await.unwrap_err();
+        let error = error.message().to_owned();
         assert!(error.contains("may have been applied"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn document_frames_keep_the_reference_operation_shape() {
+        let mux = SocketMux::new(2, 2);
+        let (pending, frame) = mux
+            .begin(Request::Document {
+                document: "Actor".into(),
+                action: "get".into(),
+                operation: json!({"action":"get", "query":{"folder":"f1"}, "index":false, "broadcast":false}),
+            })
+            .unwrap();
+        assert_eq!(
+            frame,
+            format!(
+                "42{}{}",
+                pending.id(),
+                json!(["modifyDocument", {"type":"Actor","action":"get","operation":{"action":"get","query":{"folder":"f1"},"index":false,"broadcast":false}}])
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn compendium_frames_match_the_reference_and_correlate_their_acknowledgement() {
+        let mux = SocketMux::new(4, 4);
+        let (create, create_frame) = mux
+            .begin(Request::Compendium {
+                action: "create".into(),
+                data: json!({"label":"NPCs","type":"Actor"}),
+            })
+            .unwrap();
+        assert_eq!(
+            create_frame,
+            format!(
+                "42{}{}",
+                create.id(),
+                json!(["manageCompendium", {"action":"create","data":{"label":"NPCs","type":"Actor"},"options":{}}])
+            )
+        );
+        let (remove, remove_frame) = mux
+            .begin(Request::Compendium {
+                action: "delete".into(),
+                data: json!("world.npcs"),
+            })
+            .unwrap();
+        assert_eq!(
+            remove_frame,
+            format!(
+                "42{}{}",
+                remove.id(),
+                json!(["manageCompendium", {"action":"delete","data":"world.npcs"}])
+            )
+        );
+        assert_ne!(create.id(), remove.id());
+
+        mux.receive(&format!(
+            "43{}[{}]",
+            create.id(),
+            json!({"request":{"action":"create"},"result":{"id":"world.npcs"}})
+        ));
+        mux.receive(&format!(
+            "43{}[{}]",
+            remove.id(),
+            json!({"request":{"action":"delete"},"result":"world.npcs"})
+        ));
+        assert_eq!(create.wait().await.unwrap()["result"]["id"], "world.npcs");
+        assert_eq!(remove.wait().await.unwrap()["result"], "world.npcs");
+    }
+
+    #[tokio::test]
+    async fn compendium_failures_report_the_ambiguity_of_a_possible_change() {
+        let mux = SocketMux::new(4, 4);
+        let (denied, _) = mux
+            .begin(Request::Compendium {
+                action: "delete".into(),
+                data: json!("world.npcs"),
+            })
+            .unwrap();
+        mux.receive(&format!(
+            "43{}[{}]",
+            denied.id(),
+            json!({"request":{"action":"delete"},"error":"denied"})
+        ));
+        let error = denied.wait().await.unwrap_err();
+        let error = error.message().to_owned();
+        assert!(error.contains("denied"), "{error}");
+        assert!(error.contains("may have been applied"), "{error}");
+
+        let (incomplete, _) = mux
+            .begin(Request::Compendium {
+                action: "create".into(),
+                data: json!({"label":"NPCs","type":"Actor"}),
+            })
+            .unwrap();
+        mux.receive(&format!(
+            "43{}[{}]",
+            incomplete.id(),
+            json!({"request":{"action":"create"},"result":{}})
+        ));
+        assert!(incomplete
+            .wait()
+            .await
+            .unwrap_err()
+            .message()
+            .contains("may have been applied"));
+
+        let (mismatched, _) = mux
+            .begin(Request::Compendium {
+                action: "delete".into(),
+                data: json!("world.npcs"),
+            })
+            .unwrap();
+        mux.receive(&format!(
+            "43{}[{}]",
+            mismatched.id(),
+            json!({"request":{"action":"create"},"result":"world.npcs"})
+        ));
+        assert!(mismatched
+            .wait()
+            .await
+            .unwrap_err()
+            .message()
+            .contains("may have been applied"));
+    }
+
+    #[tokio::test]
+    async fn file_browsing_frames_match_the_reference_and_reject_bad_answers() {
+        let mux = SocketMux::new(4, 4);
+        let (browse, frame) = mux
+            .begin(Request::Files {
+                target: "worlds/test".into(),
+                kind: "image".into(),
+                extensions: vec![".png".into()],
+            })
+            .unwrap();
+        assert_eq!(
+            frame,
+            format!(
+                "42{}{}",
+                browse.id(),
+                json!(["manageFiles", {"action":"browseFiles","storage":"data","target":"worlds/test"}, {"type":"image","extensions":[".png"],"wildcard":false,"render":true}])
+            )
+        );
+        mux.receive(&format!(
+            "43{}[{}]",
+            browse.id(),
+            json!({"dirs":[],"files":[]})
+        ));
+        assert_eq!(browse.wait().await.unwrap()["dirs"], json!([]));
+
+        let (denied, _) = mux
+            .begin(Request::Files {
+                target: "worlds/test".into(),
+                kind: "image".into(),
+                extensions: vec![".png".into()],
+            })
+            .unwrap();
+        mux.receive(&format!("43{}[{}]", denied.id(), json!({"error":"denied"})));
+        assert!(denied
+            .wait()
+            .await
+            .unwrap_err()
+            .message()
+            .contains("denied"));
+
+        let (malformed, _) = mux
+            .begin(Request::Files {
+                target: "worlds/test".into(),
+                kind: "image".into(),
+                extensions: vec![".png".into()],
+            })
+            .unwrap();
+        mux.receive(&format!("43{}[{}]", malformed.id(), json!({"files":[]})));
+        assert!(malformed
+            .wait()
+            .await
+            .unwrap_err()
+            .message()
+            .contains("invalid Foundry browse response"));
+    }
+
+    #[tokio::test]
+    async fn interleaved_document_and_compendium_acknowledgements_stay_separate() {
+        let mux = SocketMux::new(4, 4);
+        let (document, _) = mux
+            .begin(Request::Document {
+                document: "Actor".into(),
+                action: "get".into(),
+                operation: json!({"action":"get"}),
+            })
+            .unwrap();
+        let (compendium, _) = mux
+            .begin(Request::Compendium {
+                action: "create".into(),
+                data: json!({"label":"NPCs","type":"Actor"}),
+            })
+            .unwrap();
+        mux.receive(&format!(
+            "43{}[{}]",
+            compendium.id(),
+            json!({"request":{"action":"create"},"result":{"id":"world.npcs"}})
+        ));
+        mux.receive(&format!(
+            "43{}[{}]",
+            document.id(),
+            json!({"type":"Actor","action":"get","result":[]})
+        ));
+        assert_eq!(
+            compendium.wait().await.unwrap()["result"]["id"],
+            "world.npcs"
+        );
+        assert_eq!(document.wait().await.unwrap()["type"], "Actor");
+    }
+
+    #[tokio::test]
+    async fn acknowledgements_preserve_foundry_decimal_precision() {
+        let mux = SocketMux::new(2, 2);
+        let (pending, _) = mux
+            .begin(Request::Document {
+                document: "Actor".into(),
+                action: "get".into(),
+                operation: json!({"action":"get"}),
+            })
+            .unwrap();
+        mux.receive(&format!(
+            "43{}[{}]",
+            pending.id(),
+            json!({"type":"Actor","result":[{"scaleX":0.9615384615384615}]})
+        ));
+        let result = pending.wait().await.unwrap();
+        assert_eq!(
+            result["result"].to_string(),
+            r#"[{"scaleX":0.9615384615384615}]"#
+        );
     }
 
     #[test]
@@ -570,6 +1024,7 @@ mod tests {
             .wait()
             .await
             .unwrap_err()
+            .message()
             .contains("may have been applied"));
         assert!(mux.begin(Request::World).is_err());
     }

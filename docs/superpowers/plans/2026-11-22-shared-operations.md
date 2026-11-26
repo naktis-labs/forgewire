@@ -27,7 +27,7 @@
 
 ## Current execution status
 
-The packages below are the original acceptance checklist, not a claim that every item is complete. Shared operations, instance isolation, persistent read sockets, bounded reconnect and fake-server/transport tests have been implemented and independently reviewed in increments. The capability inventory records partial metadata parity, per-operation mutation and file sockets, deferred URL uploads, insecure TLS, and live verification gaps. The latest authentication-status fix passed scoped review; the inventory records residual retry and coverage limitations. Live mutations and uploads have not been authorized or tested. Consult the inventory for current evidence rather than interpreting unchecked historical tasks as a fresh work queue.
+The packages below are the original acceptance checklist, not a claim that every item is complete. Shared operations, instance isolation, persistent read sockets, bounded reconnect and fake-server/transport tests have been implemented and independently reviewed in increments. The capability inventory records partial metadata parity, deferred URL uploads, insecure TLS, and live verification gaps. Every operation kind — world and document reads, document changes, compendium management and file browsing — now runs on the identity's persistent connection with a distinct acknowledgement id per request. The latest authentication-status fix passed scoped review; the inventory records residual retry and coverage limitations. Live mutations and uploads have not been authorized or tested. Consult the inventory for current evidence rather than interpreting unchecked historical tasks as a fresh work queue.
 
 ## Work packages
 

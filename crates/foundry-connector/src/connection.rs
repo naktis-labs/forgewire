@@ -64,13 +64,19 @@ struct Transport {
 }
 
 #[derive(Clone, Copy)]
-struct ReconnectPolicy {
-    attempts: usize,
-    initial_delay: Duration,
-    max_delay: Duration,
-    max_jitter: Duration,
-    attempt_timeout: Duration,
-    total_timeout: Duration,
+pub(crate) struct ReconnectPolicy {
+    pub(crate) attempts: usize,
+    pub(crate) initial_delay: Duration,
+    pub(crate) max_delay: Duration,
+    pub(crate) max_jitter: Duration,
+    pub(crate) attempt_timeout: Duration,
+    pub(crate) total_timeout: Duration,
+    /// How long a world request waits for the world slot of its connection.
+    /// The world response carries no acknowledgement id, so only one world
+    /// request may be in flight per connection. The budget covers the
+    /// request and its response only: the connection handshake happens
+    /// before the slot is taken.
+    pub(crate) world_gate_timeout: Duration,
 }
 
 impl Default for ReconnectPolicy {
@@ -87,6 +93,8 @@ impl Default for ReconnectPolicy {
             attempt_timeout: Duration::from_secs(90),
             // Three attempts plus bounded backoff; longer than one full setup.
             total_timeout: Duration::from_secs(300),
+            // One world request and its response, nothing more.
+            world_gate_timeout: crate::RESPONSE_TIMEOUT,
         }
     }
 }
@@ -123,6 +131,9 @@ where
     let mut delay = policy.initial_delay;
     let mut last_error = None;
     for attempt in 0..policy.attempts {
+        // The hint belongs to the answer of this attempt only: a later
+        // failure for another reason must not wait for it.
+        let mut retry_after: Option<Duration> = None;
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             break;
@@ -133,9 +144,11 @@ where
                 if is_terminal_connect_error(&error) {
                     return Err(error);
                 }
+                retry_after = error.downcast_ref::<RetryAfter>().map(|hint| hint.after);
                 last_error = Some(error);
             }
             Err(_) => {
+                // The attempt timed out. It carries no upstream hint.
                 let error = if let Some(previous) = last_error.take() {
                     anyhow!(
                         "Timed out establishing authenticated Foundry websocket after {:?}; previous attempt failed: {previous}",
@@ -159,7 +172,12 @@ where
                 break;
             }
             let jitter = jitter(policy.max_jitter);
-            tokio::time::sleep((delay + jitter.min(policy.max_jitter)).min(remaining)).await;
+            let wait = delay + jitter.min(policy.max_jitter);
+            let wait = match retry_after {
+                Some(hint) if hint > wait => hint,
+                _ => wait,
+            };
+            tokio::time::sleep(wait.min(remaining)).await;
             delay = delay.saturating_mul(2).min(policy.max_delay);
         }
     }
@@ -200,6 +218,28 @@ where
 
 #[derive(Debug)]
 pub(crate) struct TerminalConnectError(String);
+
+/// An upstream `Retry-After` hint. The reconnect loop waits at least this
+/// long before the next attempt; the aggregate deadline still bounds the
+/// whole reconnect, so the hint can never extend it.
+///
+/// The hint carries the upstream message it belongs to: the message is what
+/// the caller sees, and the hint must not hide it.
+#[derive(Debug)]
+pub(crate) struct RetryAfter {
+    pub(crate) after: Duration,
+    pub(crate) message: String,
+}
+
+impl std::fmt::Display for RetryAfter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}; upstream asked to retry after {:?}",
+            self.message, self.after
+        )
+    }
+}
 
 impl std::fmt::Display for TerminalConnectError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -247,9 +287,17 @@ impl Drop for InFlight<'_> {
 
 impl ConnectionManager {
     fn with_limits(capacity: usize, idle_timeout: Duration) -> Self {
+        Self::with_policy(capacity, idle_timeout, ReconnectPolicy::default())
+    }
+
+    pub(crate) fn with_policy(
+        capacity: usize,
+        idle_timeout: Duration,
+        reconnect: ReconnectPolicy,
+    ) -> Self {
         Self {
             connections: Arc::new(Mutex::new(HashMap::new())),
-            reconnect: ReconnectPolicy::default(),
+            reconnect,
             capacity: capacity.max(1),
             idle_timeout,
             reaper_started: AtomicBool::new(false),
@@ -309,15 +357,21 @@ impl ConnectionManager {
         Ok(connection)
     }
 
-    pub(crate) async fn world<F, Fut>(&self, key: IdentityKey, mut connect: F) -> Result<Value>
+    /// Adopt or establish the identity's authenticated connection.
+    ///
+    /// The transport lock is held while a connection is established, so
+    /// concurrent requests for one identity share a single handshake. The
+    /// returned transport carries the epoch it belongs to; a later request
+    /// that finds a different epoch knows the connection was replaced.
+    async fn ensure_transport<F, Fut>(
+        &self,
+        connection: &Arc<Connection>,
+        connect: &mut F,
+    ) -> Result<Transport>
     where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<Socket>>,
     {
-        let connection = self.reserve(key).await?;
-        let _world_guard = timeout(crate::RESPONSE_TIMEOUT, connection.world_gate.lock())
-            .await
-            .map_err(|_| anyhow!("Timed out waiting for Foundry world request capacity"))?;
         let mut slot = connection.transport.lock().await;
         if slot
             .as_ref()
@@ -326,37 +380,67 @@ impl ConnectionManager {
             slot.take();
         }
         if slot.is_none() {
-            *slot = Some(connect_transport(&connection, &mut connect, self.reconnect).await?);
+            *slot = Some(connect_transport(connection, connect, self.reconnect).await?);
         }
-        let (pending, frame) = match slot
-            .as_ref()
-            .unwrap()
-            .mux
-            .begin(crate::socket_mux::Request::World)
-        {
+        Ok(slot.as_ref().unwrap().clone())
+    }
+
+    /// Run one request on the identity's persistent connection.
+    ///
+    /// Every request kind — document read, document mutation, compendium
+    /// management and file browsing — shares this path, so the connection is
+    /// established once per identity and reused by later requests instead of
+    /// being reopened per operation. Each request carries its own
+    /// acknowledgement id, so concurrent requests on one connection are
+    /// answered independently.
+    pub(crate) async fn exchange<F, Fut>(
+        &self,
+        key: IdentityKey,
+        request: crate::socket_mux::Request,
+        label: &str,
+        mut connect: F,
+    ) -> Result<Value>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<Socket>>,
+    {
+        let mutation = request_is_mutation(&request);
+        let connection = self.reserve(key).await?;
+        let transport = self.ensure_transport(&connection, &mut connect).await?;
+        let (pending, frame) = match transport.mux.begin(request) {
             Ok(request) => request,
             Err(error) => return Err(anyhow!(error)),
         };
-        let transport = slot.as_ref().unwrap().clone();
-        drop(slot);
         let mut in_flight = InFlight(
             &connection.epoch,
             transport.epoch,
             &connection.last_used,
             true,
         );
-        let write = if transport.mux.mark_sent(pending.id()) {
-            transport.write(Message::Text(frame.into())).await
-        } else {
-            Err(anyhow!(
-                "Foundry world request was cancelled before writing"
-            ))
-        };
-        if let Err(error) = write {
+        if !transport.mux.mark_sent(pending.id()) {
+            // The frame was never written, so a change certainly did not
+            // happen. The socket may be gone: drop it, so the next request
+            // for this identity reconnects instead of reusing a dead one.
             transport.mux.disconnect();
             invalidate_epoch(&connection.epoch, transport.epoch);
             in_flight.3 = false;
-            return Err(anyhow!("Failed writing Foundry world request: {error}"));
+            return Err(anyhow!(
+                "Foundry {label} request was cancelled before writing"
+            ));
+        }
+        if let Err(error) = transport.write(Message::Text(frame.into())).await {
+            transport.mux.disconnect();
+            invalidate_epoch(&connection.epoch, transport.epoch);
+            in_flight.3 = false;
+            let message = format!(
+                "Failed writing Foundry {label} request{}: {error}",
+                ambiguity(mutation)
+            );
+            return Err(if mutation {
+                crate::ambiguous_mutation(message)
+            } else {
+                anyhow!(message)
+            });
         }
         match timeout(crate::RESPONSE_TIMEOUT, pending.wait()).await {
             Ok(Ok(value)) => {
@@ -367,102 +451,138 @@ impl ConnectionManager {
                 Ok(value)
             }
             Ok(Err(error)) => {
-                transport.mux.disconnect();
-                invalidate_epoch(&connection.epoch, transport.epoch);
+                if error.is_transport() {
+                    transport.mux.disconnect();
+                    invalidate_epoch(&connection.epoch, transport.epoch);
+                }
+                // The upstream answered and refused this request: the socket
+                // is healthy, so the connection stays in use for other
+                // requests.
                 in_flight.3 = false;
-                Err(anyhow!(error))
+                Err(if mutation {
+                    crate::ambiguous_mutation(error.message().to_owned())
+                } else {
+                    anyhow!(error.message().to_owned())
+                })
             }
             Err(_) => {
                 transport.mux.disconnect();
                 invalidate_epoch(&connection.epoch, transport.epoch);
                 in_flight.3 = false;
-                Err(anyhow!("Timed out waiting for Foundry world response"))
+                let message = format!(
+                    "Timed out waiting for Foundry {label} response{}",
+                    ambiguity(mutation)
+                );
+                Err(if mutation {
+                    crate::ambiguous_mutation(message)
+                } else {
+                    anyhow!(message)
+                })
             }
         }
     }
 
-    pub(crate) async fn document_get<F, Fut>(
-        &self,
-        key: IdentityKey,
-        document: String,
-        operation: Value,
-        mut connect: F,
-    ) -> Result<Value>
+    /// Read the world through the identity's persistent connection.
+    ///
+    /// The world response carries no acknowledgement id, so only one world
+    /// request may be in flight per connection. The connection is established
+    /// *before* the world slot is taken: a slow handshake must not consume
+    /// the world request's own response budget, and a second world request
+    /// must wait for the first one's response, not for its handshake.
+    pub(crate) async fn world<F, Fut>(&self, key: IdentityKey, mut connect: F) -> Result<Value>
     where
         F: FnMut() -> Fut,
         Fut: std::future::Future<Output = Result<Socket>>,
     {
         let connection = self.reserve(key).await?;
-        let mut slot = connection.transport.lock().await;
-        if slot
-            .as_ref()
-            .is_some_and(|transport| connection.epoch.load(Ordering::Acquire) != transport.epoch)
-        {
-            slot.take();
-        }
-        if slot.is_none() {
-            *slot = Some(connect_transport(&connection, &mut connect, self.reconnect).await?);
-        }
-        let (pending, frame) =
-            match slot
-                .as_ref()
-                .unwrap()
-                .mux
-                .begin(crate::socket_mux::Request::Document {
-                    document,
-                    action: "get".into(),
-                    operation,
-                }) {
+        let mut retries = 0;
+        loop {
+            let transport = self.ensure_transport(&connection, &mut connect).await?;
+            let guard = timeout(
+                self.reconnect.world_gate_timeout,
+                connection.world_gate.lock(),
+            )
+            .await
+            .map_err(|_| anyhow!("Timed out waiting for Foundry world request capacity"))?;
+            if connection.epoch.load(Ordering::Acquire) != transport.epoch {
+                // Another request replaced the connection while this one
+                // waited for the world slot. Start again on the new one.
+                drop(guard);
+                retries += 1;
+                if retries >= 2 {
+                    return Err(anyhow!(
+                        "Foundry world request could not keep a stable connection"
+                    ));
+                }
+                continue;
+            }
+            let (pending, frame) = match transport.mux.begin(crate::socket_mux::Request::World) {
                 Ok(request) => request,
                 Err(error) => return Err(anyhow!(error)),
             };
-        let transport = slot.as_ref().unwrap().clone();
-        drop(slot);
-        let mut in_flight = InFlight(
-            &connection.epoch,
-            transport.epoch,
-            &connection.last_used,
-            true,
-        );
-        let write = if transport.mux.mark_sent(pending.id()) {
-            transport.write(Message::Text(frame.into())).await
-        } else {
-            Err(anyhow!(
-                "Foundry document request was cancelled before writing"
-            ))
-        };
-        if let Err(error) = write {
-            transport.mux.disconnect();
-            invalidate_epoch(&connection.epoch, transport.epoch);
-            in_flight.3 = false;
-            return Err(anyhow!("Failed writing Foundry document request: {error}"));
-        }
-        match timeout(crate::RESPONSE_TIMEOUT, pending.wait()).await {
-            Ok(Ok(response)) => {
-                let result = response
-                    .get("result")
-                    .filter(|value| value.is_array())
-                    .cloned()
-                    .ok_or_else(|| anyhow!("Foundry document response has invalid result"));
-                connection
-                    .last_used
-                    .store(monotonic_millis(), Ordering::Relaxed);
-                in_flight.3 = false;
-                result
-            }
-            Ok(Err(error)) => {
+            let mut in_flight = InFlight(
+                &connection.epoch,
+                transport.epoch,
+                &connection.last_used,
+                true,
+            );
+            let write = if transport.mux.mark_sent(pending.id()) {
+                transport.write(Message::Text(frame.into())).await
+            } else {
+                Err(anyhow!(
+                    "Foundry world request was cancelled before writing"
+                ))
+            };
+            if let Err(error) = write {
                 transport.mux.disconnect();
                 invalidate_epoch(&connection.epoch, transport.epoch);
                 in_flight.3 = false;
-                Err(anyhow!(error))
+                return Err(anyhow!("Failed writing Foundry world request: {error}"));
             }
-            Err(_) => {
-                transport.mux.disconnect();
-                invalidate_epoch(&connection.epoch, transport.epoch);
-                in_flight.3 = false;
-                Err(anyhow!("Timed out waiting for Foundry document response"))
-            }
+            return match timeout(crate::RESPONSE_TIMEOUT, pending.wait()).await {
+                Ok(Ok(value)) => {
+                    connection
+                        .last_used
+                        .store(monotonic_millis(), Ordering::Relaxed);
+                    in_flight.3 = false;
+                    Ok(value)
+                }
+                Ok(Err(error)) => {
+                    if error.is_transport() {
+                        transport.mux.disconnect();
+                        invalidate_epoch(&connection.epoch, transport.epoch);
+                    }
+                    in_flight.3 = false;
+                    Err(anyhow!(error.message().to_owned()))
+                }
+                Err(_) => {
+                    transport.mux.disconnect();
+                    invalidate_epoch(&connection.epoch, transport.epoch);
+                    in_flight.3 = false;
+                    Err(anyhow!("Timed out waiting for Foundry world response"))
+                }
+            };
         }
+    }
+}
+
+/// Whether a request can change the world, and therefore has to report an
+/// ambiguous outcome when it fails.
+fn request_is_mutation(request: &crate::socket_mux::Request) -> bool {
+    match request {
+        crate::socket_mux::Request::Document { action, .. } => action != "get",
+        crate::socket_mux::Request::Compendium { .. } => true,
+        crate::socket_mux::Request::World | crate::socket_mux::Request::Files { .. } => false,
+    }
+}
+
+/// The wording a failed mutation carries: a timeout or a broken socket does
+/// not prove the operation was not applied.
+fn ambiguity(mutation: bool) -> &'static str {
+    if mutation {
+        ", and the operation may have been applied"
+    } else {
+        ""
     }
 }
 
@@ -628,6 +748,7 @@ mod tests {
             max_jitter: Duration::ZERO,
             attempt_timeout: Duration::from_secs(1),
             total_timeout: Duration::from_secs(1),
+            world_gate_timeout: Duration::from_secs(30),
         };
         let attempts = Arc::new(AtomicUsize::new(0));
         let observed = attempts.clone();
@@ -658,6 +779,7 @@ mod tests {
             max_jitter: Duration::ZERO,
             attempt_timeout: Duration::from_secs(2),
             total_timeout: Duration::from_secs(5),
+            world_gate_timeout: Duration::from_secs(30),
         };
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let observed = attempts.clone();
@@ -688,6 +810,7 @@ mod tests {
             max_jitter: Duration::ZERO,
             attempt_timeout: Duration::from_secs(5),
             total_timeout: Duration::from_secs(10),
+            world_gate_timeout: Duration::from_secs(30),
         };
         let mut connect = || async {
             tokio::time::sleep(Duration::from_secs(4)).await;
@@ -709,6 +832,7 @@ mod tests {
             max_jitter: Duration::ZERO,
             attempt_timeout: Duration::from_secs(2),
             total_timeout: Duration::from_secs(7),
+            world_gate_timeout: Duration::from_secs(30),
         };
         let attempts = Arc::new(AtomicUsize::new(0));
         let observed = attempts.clone();
@@ -740,6 +864,7 @@ mod tests {
             max_jitter: Duration::ZERO,
             attempt_timeout: Duration::from_secs(2),
             total_timeout: Duration::from_millis(2500),
+            world_gate_timeout: Duration::from_secs(30),
         };
         let attempts = Arc::new(AtomicUsize::new(0));
         let observed = attempts.clone();

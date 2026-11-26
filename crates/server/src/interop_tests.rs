@@ -69,3 +69,191 @@ async fn mcp_journal_reads_reach_real_connector_and_disposable_world() {
     );
     assert!(requests.iter().any(|r| r.contains("journal-2")), "{log:?}");
 }
+
+#[tokio::test]
+async fn an_authenticated_change_reaches_the_real_connector_over_the_identity_connection() {
+    let world = FakeWorld::start_with_world(WorldFixture::journal_world()).await;
+    let credential = FoundryCredential {
+        id: Some("fixture".into()),
+        hostname: world.base_url().into(),
+        userid: Some("user-1".into()),
+        username: Some("Interop User".into()),
+        password: String::new(),
+    };
+    let app = Arc::new(App {
+        client: Arc::new(FoundryClient::for_loopback(world.base_url()).unwrap()),
+        instances: instances::Instances::new(vec![credential]).unwrap(),
+        selections: instances::Selections::new(),
+        allow_writes: true,
+    });
+    let token = auth::ScopedToken::new(
+        auth::Scope::new("fixture").unwrap(),
+        "interop-secret".to_owned(),
+    )
+    .unwrap();
+    let router = secured_router(app, Some(token));
+
+    // A read first, so the identity's connection exists.
+    let read = router
+        .clone()
+        .oneshot(
+            Request::get("/api/documents/journal")
+                .header("host", "localhost")
+                .header("authorization", "Bearer fixture.interop-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(read.status(), StatusCode::OK);
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::post("/api/write/create_document")
+                .header("host", "localhost")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer fixture.interop-secret")
+                .body(Body::from(
+                    json!({"kind":"Actor","data":[{"name":"Interop Hero"}]}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body[0]["_id"], "created-0", "{body}");
+
+    // The read and the change shared the identity's one authenticated socket.
+    let log = world.request_log();
+    let sockets: std::collections::HashSet<_> = log
+        .iter()
+        .filter(|entry| entry.contains("modifyDocument"))
+        .filter_map(|entry| entry.split("socket=").nth(1))
+        .collect();
+    assert_eq!(
+        sockets.len(),
+        1,
+        "the change opened its own socket: {log:?}"
+    );
+    assert_eq!(
+        log.iter()
+            .filter(|entry| entry.contains("modifyDocument"))
+            .count(),
+        2,
+        "both the read and the change should reach the world: {log:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_change_that_loses_its_socket_is_reported_as_possibly_applied() {
+    let world = FakeWorld::start_with_world(WorldFixture::journal_world()).await;
+    world.drop_socket_on_mutation();
+    let credential = FoundryCredential {
+        id: Some("fixture".into()),
+        hostname: world.base_url().into(),
+        userid: Some("user-1".into()),
+        username: Some("Interop User".into()),
+        password: String::new(),
+    };
+    let app = Arc::new(App {
+        client: Arc::new(FoundryClient::for_loopback(world.base_url()).unwrap()),
+        instances: instances::Instances::new(vec![credential]).unwrap(),
+        selections: instances::Selections::new(),
+        allow_writes: true,
+    });
+    let token = auth::ScopedToken::new(
+        auth::Scope::new("fixture").unwrap(),
+        "interop-secret".to_owned(),
+    )
+    .unwrap();
+    let router = secured_router(app, Some(token));
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::post("/api/write/create_document")
+                .header("host", "localhost")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer fixture.interop-secret")
+                .body(Body::from(
+                    json!({"kind":"Actor","data":[{"name":"Interop Hero"}]}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["outcome"], "possibly_applied", "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap()
+            .contains("may have been applied"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn an_upload_the_connector_refuses_is_a_caller_mistake() {
+    // The connector refuses an upload target that escapes its directory
+    // before it reaches Foundry. That is caller input, so the REST route
+    // answers 400 instead of an upstream failure, and nothing was sent.
+    let world = FakeWorld::start_with_world(WorldFixture::journal_world()).await;
+    let credential = FoundryCredential {
+        id: Some("fixture".into()),
+        hostname: world.base_url().into(),
+        userid: Some("user-1".into()),
+        username: Some("Interop User".into()),
+        password: String::new(),
+    };
+    let app = Arc::new(App {
+        client: Arc::new(FoundryClient::for_loopback(world.base_url()).unwrap()),
+        instances: instances::Instances::new(vec![credential]).unwrap(),
+        selections: instances::Selections::new(),
+        allow_writes: true,
+    });
+    let token = auth::ScopedToken::new(
+        auth::Scope::new("fixture").unwrap(),
+        "interop-secret".to_owned(),
+    )
+    .unwrap();
+    let router = secured_router(app, Some(token));
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::post("/api/files")
+                .header("host", "localhost")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer fixture.interop-secret")
+                .body(Body::from(
+                    json!({
+                        "target": "../escape",
+                        "filename": "a.png",
+                        "data_base64": "aGVsbG8=",
+                        "overwrite": true,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(body["error"], "invalid upload target", "{body}");
+    assert!(body.get("outcome").is_none(), "{body}");
+
+    // The request never reached the world.
+    let log = world.request_log();
+    assert!(
+        !log.iter().any(|entry| entry.contains("upload")),
+        "the refused upload reached the world: {log:?}"
+    );
+}

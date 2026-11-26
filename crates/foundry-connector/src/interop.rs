@@ -183,6 +183,26 @@ pub(crate) struct FakeState {
     pub(crate) document_requests: tokio::sync::Semaphore,
     pub(crate) release_document_acks: tokio::sync::Semaphore,
     pub(crate) namespace_after_world: Mutex<Option<String>>,
+    /// How long the authentication request takes, so a test can make the
+    /// connection handshake slow.
+    pub(crate) auth_delay_ms: AtomicUsize,
+    /// Close the socket instead of answering a mutating request, so a test
+    /// can observe the ambiguous outcome of a change that may have been
+    /// applied.
+    pub(crate) disconnect_on_mutation: AtomicBool,
+    /// Refuse document requests for this document type, so a test can
+    /// observe that an upstream refusal leaves the connection usable.
+    pub(crate) error_document: Mutex<Option<String>>,
+    /// The `Retry-After` hint, in seconds, sent with a transient
+    /// authentication status.
+    pub(crate) auth_retry_after_seconds: AtomicUsize,
+    /// The status `GET /join` answers with. Two hundred means success.
+    pub(crate) join_status: AtomicUsize,
+    /// How many authentication requests hang instead of answering, so a test
+    /// can make one attempt time out.
+    pub(crate) auth_hang_attempts: AtomicUsize,
+    /// How long a hanging authentication request waits before it answers.
+    pub(crate) auth_hang_ms: AtomicUsize,
 }
 
 /// A running disposable Foundry world.
@@ -209,6 +229,15 @@ impl FakeWorld {
     /// WebSocket to the world.
     pub fn request_log(&self) -> Vec<String> {
         self.state.requests.lock().unwrap().clone()
+    }
+
+    /// Make the world drop the socket instead of answering a change, so a
+    /// harness can observe the ambiguous outcome of a change that may have
+    /// been applied.
+    pub fn drop_socket_on_mutation(&self) {
+        self.state
+            .disconnect_on_mutation
+            .store(true, Ordering::Release);
     }
 
     /// Start a canned world: one synthetic document per requested type and a
@@ -278,6 +307,13 @@ impl FakeWorld {
             document_requests: tokio::sync::Semaphore::new(0),
             release_document_acks: tokio::sync::Semaphore::new(0),
             namespace_after_world: Mutex::new(None),
+            auth_delay_ms: AtomicUsize::new(0),
+            disconnect_on_mutation: AtomicBool::new(false),
+            error_document: Mutex::new(None),
+            auth_retry_after_seconds: AtomicUsize::new(0),
+            join_status: AtomicUsize::new(200),
+            auth_hang_attempts: AtomicUsize::new(0),
+            auth_hang_ms: AtomicUsize::new(5000),
         });
         Self::serve(state).await
     }
@@ -310,6 +346,13 @@ impl FakeWorld {
             document_requests: tokio::sync::Semaphore::new(0),
             release_document_acks: tokio::sync::Semaphore::new(0),
             namespace_after_world: Mutex::new(None),
+            auth_delay_ms: AtomicUsize::new(0),
+            disconnect_on_mutation: AtomicBool::new(false),
+            error_document: Mutex::new(None),
+            auth_retry_after_seconds: AtomicUsize::new(0),
+            join_status: AtomicUsize::new(200),
+            auth_hang_attempts: AtomicUsize::new(0),
+            auth_hang_ms: AtomicUsize::new(5000),
         });
         Self::serve(state).await
     }
@@ -410,8 +453,13 @@ async fn status(State(state): State<Arc<FakeState>>) -> Json<Value> {
     Json(json!({"release":{"generation":state.generation}}))
 }
 
-async fn join(State(state): State<Arc<FakeState>>) -> impl IntoResponse {
+async fn join(State(state): State<Arc<FakeState>>) -> axum::response::Response {
     state.requests.lock().unwrap().push("GET /join".into());
+    let status = axum::http::StatusCode::from_u16(state.join_status.load(Ordering::Acquire) as u16)
+        .unwrap_or(axum::http::StatusCode::OK);
+    if !status.is_success() {
+        return (status, Json(json!({"status": "unavailable"}))).into_response();
+    }
     let cookie = format!("session={}; Path=/; HttpOnly", state.session);
     (
         [(
@@ -420,13 +468,14 @@ async fn join(State(state): State<Arc<FakeState>>) -> impl IntoResponse {
         )],
         "",
     )
+        .into_response()
 }
 
 async fn authenticate(
     State(state): State<Arc<FakeState>>,
     headers: HeaderMap,
     Json(body): Json<Value>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
     let remaining_transient = state.auth_transient_attempts.load(Ordering::Acquire);
     if remaining_transient > 0
         && state
@@ -448,7 +497,40 @@ async fn authenticate(
             .lock()
             .unwrap()
             .push(format!("POST /join status={}", status.as_u16()));
-        return (status, Json(json!({"status":"temporarily unavailable"})));
+        let mut response =
+            (status, Json(json!({"status":"temporarily unavailable"}))).into_response();
+        let seconds = state.auth_retry_after_seconds.load(Ordering::Acquire);
+        if seconds > 0 {
+            if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, value);
+            }
+        }
+        return response;
+    }
+    let remaining_hangs = state.auth_hang_attempts.load(Ordering::Acquire);
+    if remaining_hangs > 0
+        && state
+            .auth_hang_attempts
+            .compare_exchange(
+                remaining_hangs,
+                remaining_hangs - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    {
+        // Answer long after any attempt timeout, so the client gives up on
+        // this attempt.
+        tokio::time::sleep(std::time::Duration::from_millis(
+            state.auth_hang_ms.load(Ordering::Acquire) as u64,
+        ))
+        .await;
+    }
+    let delay = state.auth_delay_ms.load(Ordering::Relaxed);
+    if delay > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(delay as u64)).await;
     }
     let origin = headers
         .get("origin")
@@ -476,6 +558,7 @@ async fn authenticate(
             axum::http::StatusCode::UNAUTHORIZED,
             Json(json!({"status":"success"})),
         )
+            .into_response()
     } else if !state.fail_authentication.load(Ordering::Acquire)
         && origin == expected_origin
         && cookie == expected_cookie
@@ -485,11 +568,13 @@ async fn authenticate(
             axum::http::StatusCode::OK,
             Json(json!({"status":"success"})),
         )
+            .into_response()
     } else {
         (
             axum::http::StatusCode::UNAUTHORIZED,
             Json(json!({"status":"failure"})),
         )
+            .into_response()
     }
 }
 
@@ -617,7 +702,58 @@ async fn socket_session(mut socket: WebSocket, state: Arc<FakeState>, socket_id:
             let document = payload[1]["type"].as_str().unwrap().to_owned();
             let action = payload[1]["action"].as_str().unwrap_or("get").to_owned();
             let query = payload[1]["operation"]["query"].clone();
-            let result = document_result(&state, &document, &query);
+            let refused = state
+                .error_document
+                .lock()
+                .unwrap()
+                .as_deref()
+                .is_some_and(|kind| kind == document);
+            if refused {
+                let response = format!(
+                    "43{ack}[{}]",
+                    json!({"type":document,"action":action,"error":{"message":"denied"}})
+                );
+                let _ = sink
+                    .lock()
+                    .await
+                    .send(AxumMessage::Text(response.into()))
+                    .await;
+                continue;
+            }
+            if action != "get" && state.disconnect_on_mutation.load(Ordering::Acquire) {
+                state
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .push(format!("WS-CLOSE mutation socket={socket_id}"));
+                let _ = sink.lock().await.send(AxumMessage::Close(None)).await;
+                return;
+            }
+            let result = match action.as_str() {
+                "create" => payload[1]["operation"]["data"]
+                    .as_array()
+                    .map(|items| {
+                        items
+                            .iter()
+                            .enumerate()
+                            .map(|(index, item)| {
+                                let mut item = item.clone();
+                                item["_id"] = json!(format!("created-{index}"));
+                                item
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                "update" => payload[1]["operation"]["updates"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default(),
+                "delete" => payload[1]["operation"]["ids"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default(),
+                _ => document_result(&state, &document, &query),
+            };
             let response = format!(
                 "43{ack}[{}]",
                 json!({"type":document,"action":action,"result":result})
@@ -647,6 +783,54 @@ async fn socket_session(mut socket: WebSocket, state: Arc<FakeState>, socket_id:
                     .send(AxumMessage::Text(response.into()))
                     .await;
             });
+        } else if text.contains("[\"manageCompendium\"") {
+            state
+                .requests
+                .lock()
+                .unwrap()
+                .push(format!("WS {text} socket={socket_id}"));
+            let (ack, payload) = text
+                .strip_prefix("42")
+                .and_then(|tail| {
+                    let end = tail.find('[')?;
+                    Some((&tail[..end], &tail[end..]))
+                })
+                .unwrap();
+            let payload: Value = serde_json::from_str(payload).unwrap();
+            let action = payload[1]["action"].as_str().unwrap_or("create").to_owned();
+            let result = if action == "create" {
+                json!({"id":"world.created-pack"})
+            } else {
+                json!("world.deleted-pack")
+            };
+            let response = format!(
+                "43{ack}[{}]",
+                json!({"request":{"action":action},"result":result})
+            );
+            let _ = sink
+                .lock()
+                .await
+                .send(AxumMessage::Text(response.into()))
+                .await;
+        } else if text.contains("[\"manageFiles\"") {
+            state
+                .requests
+                .lock()
+                .unwrap()
+                .push(format!("WS {text} socket={socket_id}"));
+            let ack = text
+                .strip_prefix("42")
+                .and_then(|tail| tail.split('[').next())
+                .unwrap_or("1");
+            let response = format!(
+                "43{ack}[{}]",
+                json!({"dirs":[{"name":"worlds"}],"files":[{"name":"portrait.png"}]})
+            );
+            let _ = sink
+                .lock()
+                .await
+                .send(AxumMessage::Text(response.into()))
+                .await;
         } else {
             state.requests.lock().unwrap().push(format!("WS {text}"));
         }

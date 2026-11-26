@@ -254,6 +254,47 @@ fn has_complete_identity(credential: &FoundryCredential) -> bool {
             .is_some_and(|value| !value.trim().is_empty())
 }
 
+/// The identity key of a configured credential. Two credentials that differ
+/// in any part never share a connection, session or socket.
+fn identity_key(credential: &FoundryCredential) -> connection::IdentityKey {
+    connection::IdentityKey::new(&[
+        credential.id.as_deref().unwrap_or(""),
+        &credential.hostname,
+        credential.userid.as_deref().unwrap_or(""),
+        credential.username.as_deref().unwrap_or(""),
+        &credential.password,
+    ])
+}
+
+/// Whether an upstream status is worth another attempt. A refusal is not:
+/// retrying it only repeats the same answer.
+fn is_transient_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error() || matches!(status.as_u16(), 408 | 425 | 429)
+}
+
+/// Carry an upstream `Retry-After` hint into the reconnect loop.
+///
+/// Only the delta-seconds form is honored; an HTTP date is ignored rather
+/// than guessed at. The hint never extends the reconnect deadline, so a
+/// server cannot make the gateway wait longer than its own budget.
+fn retry_after(headers: &reqwest::header::HeaderMap, error: anyhow::Error) -> anyhow::Error {
+    let Some(seconds) = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+    else {
+        return error;
+    };
+    let message = error.to_string();
+    error.context(connection::RetryAfter {
+        after: Duration::from_secs(seconds.min(MAX_RETRY_AFTER_SECONDS)),
+        message,
+    })
+}
+
+/// The longest `Retry-After` the gateway will wait for.
+const MAX_RETRY_AFTER_SECONDS: u64 = 60;
+
 fn socket_request(
     host: &str,
     session: &str,
@@ -387,15 +428,86 @@ fn write_operation(
     Ok(operation)
 }
 
+/// A change whose outcome is unknown.
+///
+/// The request may have reached Foundry, but the answer does not prove
+/// whether the change was applied: a timeout, a broken socket and an
+/// invalid acknowledgement all leave that open. The gateway reports this
+/// instead of retrying the change, so a caller learns the outcome by
+/// reading the affected document again.
+#[derive(Debug)]
+pub struct AmbiguousMutation {
+    message: String,
+}
+
+impl AmbiguousMutation {
+    /// The failure message, which states that the change may have been
+    /// applied.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for AmbiguousMutation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AmbiguousMutation {}
+
+/// Mark a failure as a change whose outcome is unknown. The message is
+/// shown to the caller unchanged.
+pub fn ambiguous_mutation(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(AmbiguousMutation {
+        message: message.into(),
+    })
+}
+
+/// Caller input the connector refused before it reached Foundry.
+///
+/// The request never left the gateway, so the failure is a caller mistake
+/// and not an upstream fault.
+#[derive(Debug)]
+pub struct InvalidInput {
+    message: String,
+}
+
+impl InvalidInput {
+    /// The failure message.
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl std::fmt::Display for InvalidInput {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for InvalidInput {}
+
+/// Mark a failure as caller input the connector refused.
+pub fn invalid_input(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(InvalidInput {
+        message: message.into(),
+    })
+}
+
 fn validate_write_ack(response: &Value, action: &str, requested: &Value) -> Result<()> {
     if response.get("action").and_then(Value::as_str) != Some(action) {
-        bail!("Foundry document response has unexpected action, and the operation may have been applied");
+        return Err(ambiguous_mutation(
+            "Foundry document response has unexpected action, and the operation may have been applied",
+        ));
     }
     let result = response
         .get("result")
         .and_then(Value::as_array)
         .ok_or_else(|| {
-            anyhow!("Foundry document response has invalid result, and the operation may have been applied")
+            ambiguous_mutation(
+                "Foundry document response has invalid result, and the operation may have been applied",
+            )
         })?;
     let requested = requested
         .as_array()
@@ -408,11 +520,15 @@ fn validate_write_ack(response: &Value, action: &str, requested: &Value) -> Resu
                 let valid = id.is_some_and(|id| !id.trim().is_empty())
                     && seen.insert(id.unwrap().to_owned());
                 if !valid {
-                    bail!("Foundry create response is incomplete, and the operation may have been applied");
+                    return Err(ambiguous_mutation(
+                        "Foundry create response is incomplete, and the operation may have been applied",
+                    ));
                 }
             }
             if result.len() != requested.len() {
-                bail!("Foundry create response is incomplete, and the operation may have been applied");
+                return Err(ambiguous_mutation(
+                    "Foundry create response is incomplete, and the operation may have been applied",
+                ));
             }
         }
         "update" | "delete" => {
@@ -425,14 +541,20 @@ fn validate_write_ack(response: &Value, action: &str, requested: &Value) -> Resu
                 }
                 .filter(|id| !id.trim().is_empty())
                 .ok_or_else(|| {
-                    anyhow!("Foundry {action} response has malformed document id, and the operation may have been applied")
+                    ambiguous_mutation(format!(
+                        "Foundry {action} response has malformed document id, and the operation may have been applied"
+                    ))
                 })?;
                 if !seen.insert(id.to_owned()) {
-                    bail!("Foundry {action} response has duplicate document id, and the operation may have been applied");
+                    return Err(ambiguous_mutation(format!(
+                        "Foundry {action} response has duplicate document id, and the operation may have been applied"
+                    )));
                 }
             }
             if seen.len() != requested.len() {
-                bail!("Foundry {action} response has unexpected document id, and the operation may have been applied");
+                return Err(ambiguous_mutation(format!(
+                    "Foundry {action} response has unexpected document id, and the operation may have been applied"
+                )));
             }
             for value in requested {
                 let id = if action == "update" {
@@ -442,85 +564,15 @@ fn validate_write_ack(response: &Value, action: &str, requested: &Value) -> Resu
                 }
                 .ok_or_else(|| anyhow!("invalid requested document id"))?;
                 if !seen.contains(id) {
-                    bail!("Foundry {action} response is missing requested document id, and the operation may have been applied");
+                    return Err(ambiguous_mutation(format!(
+                        "Foundry {action} response is missing requested document id, and the operation may have been applied"
+                    )));
                 }
             }
         }
         _ => {}
     }
     Ok(())
-}
-
-fn document_ack_response(
-    frame: &str,
-    id: u64,
-    document: &str,
-    action: &str,
-) -> Result<Option<Value>> {
-    let expected = format!("43{id}[");
-    if !frame.starts_with(&expected) {
-        return Ok(None);
-    }
-    let start = frame
-        .find('[')
-        .ok_or_else(|| anyhow!("invalid Foundry ACK"))?;
-    let values: Value = serde_json::from_str(&frame[start..])
-        .map_err(|_| anyhow!("invalid Foundry ACK payload"))?;
-    let response = values.get(0).ok_or_else(|| anyhow!("empty Foundry ACK"))?;
-    if response
-        .get("type")
-        .and_then(Value::as_str)
-        .is_some_and(|kind| kind != document)
-    {
-        return Ok(None);
-    }
-    let applied = if action == "get" {
-        String::new()
-    } else {
-        ", and the operation may have been applied".to_string()
-    };
-    if let Some(error) = response.get("error").filter(|error| !error.is_null()) {
-        bail!(
-            "Foundry document request failed{}: {}",
-            applied,
-            error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown error")
-        );
-    }
-    if response.get("type").and_then(Value::as_str) != Some(document) {
-        return Ok(None);
-    }
-    if !response.get("result").is_some_and(Value::is_array) {
-        bail!("Foundry document response has invalid result{applied}");
-    }
-    Ok(Some(response.clone()))
-}
-
-#[cfg(test)]
-fn document_ack(frame: &str, id: u64, document: &str) -> Result<Option<Value>> {
-    Ok(document_ack_response(frame, id, document, "get")?
-        .map(|response| response["result"].clone()))
-}
-
-#[cfg(test)]
-fn document_request(ack: u64, document: &str, query: Value) -> String {
-    let payload = json!(["modifyDocument", {"type": document, "action": "get", "operation": {"action":"get", "query": query, "index": false, "broadcast": false}}]);
-    format!("42{ack}{payload}")
-}
-
-fn world_response(frame: &str) -> Result<Value> {
-    if !frame.starts_with("430") {
-        bail!("not a Foundry world response");
-    }
-    let values: Value =
-        serde_json::from_str(&frame[3..]).map_err(|_| anyhow!("invalid Foundry world response"))?;
-    values
-        .get(0)
-        .filter(|v| v.is_object())
-        .cloned()
-        .ok_or_else(|| anyhow!("Foundry world response did not contain metadata"))
 }
 
 fn bounded_string(value: &str) -> Option<String> {
@@ -687,6 +739,18 @@ impl FoundryClient {
         Self::for_loopback(base_url)
     }
 
+    /// A client with an explicit connection manager, so a test can drive
+    /// the reconnect and world-slot budgets it needs.
+    #[cfg(test)]
+    fn for_test_with_connections(
+        base_url: &str,
+        connections: std::sync::Arc<connection::ConnectionManager>,
+    ) -> Result<Self> {
+        let mut client = Self::for_test(base_url)?;
+        client.connections = connections;
+        Ok(client)
+    }
+
     fn url_for(&self, host: &str, path: &str) -> Result<Url> {
         #[cfg(any(test, feature = "loopback-interop"))]
         if let Some(base) = &self.loopback_base_url {
@@ -779,7 +843,14 @@ impl FoundryClient {
             .await
             .map_err(|_| anyhow!("Foundry session request failed or timed out"))?;
         if !response.status().is_success() {
-            bail!("Foundry session request returned an unsuccessful status");
+            let status = response.status();
+            let message =
+                format!("Foundry session request returned an unsuccessful status {status}");
+            return Err(if is_transient_status(status) {
+                retry_after(response.headers(), anyhow!("{message}"))
+            } else {
+                connection::mark_terminal(anyhow!("{message}"))
+            });
         }
         let session = response
             .headers()
@@ -823,8 +894,11 @@ impl FoundryClient {
             .map_err(|_| anyhow!("Foundry authentication request failed or timed out"))?;
         let status = auth.status();
         if !status.is_success() {
-            if status.is_server_error() || matches!(status.as_u16(), 408 | 425 | 429) {
-                bail!("Foundry authentication request returned transient status {status}");
+            if is_transient_status(status) {
+                return Err(retry_after(
+                    auth.headers(),
+                    anyhow!("Foundry authentication request returned transient status {status}"),
+                ));
             }
             return Err(connection::mark_terminal(anyhow!(
                 "Foundry authentication failed (HTTP status {status})"
@@ -919,62 +993,52 @@ impl FoundryClient {
         document: &str,
         operation: Value,
     ) -> Result<Value> {
+        let key = identity_key(credential);
         if document == "World" {
-            let key = connection::IdentityKey::new(&[
-                credential.id.as_deref().unwrap_or(""),
-                &credential.hostname,
-                credential.userid.as_deref().unwrap_or(""),
-                credential.username.as_deref().unwrap_or(""),
-                &credential.password,
-            ]);
             return self
                 .connections
-                .world(key, || async {
-                    let (session, generation, userid) = self.session(credential).await?;
-                    let request =
-                        self.socket_request(&credential.hostname, &session, generation)?;
-                    let mut socket = timeout(SOCKET_CONNECT_TIMEOUT, connect_socket(request))
-                        .await
-                        .map_err(|_| anyhow!("Foundry websocket connection timed out"))?
-                        .map_err(|_| anyhow!("Foundry websocket connection failed"))?;
-                    timeout(
-                        SESSION_TIMEOUT,
-                        wait_for_session(&mut socket, &session, &userid),
-                    )
-                    .await
-                    .map_err(|_| anyhow!("Timed out waiting for Foundry session binding"))??;
-                    Ok(socket)
-                })
+                .world(key, || self.connect_for(credential))
                 .await;
         }
-        if operation.get("action").and_then(Value::as_str) == Some("get") {
-            let key = connection::IdentityKey::new(&[
-                credential.id.as_deref().unwrap_or(""),
-                &credential.hostname,
-                credential.userid.as_deref().unwrap_or(""),
-                credential.username.as_deref().unwrap_or(""),
-                &credential.password,
-            ]);
-            return self
-                .connections
-                .document_get(key, document.to_owned(), operation, || async {
-                    let (session, generation, userid) = self.session(credential).await?;
-                    let request =
-                        self.socket_request(&credential.hostname, &session, generation)?;
-                    let mut socket = timeout(SOCKET_CONNECT_TIMEOUT, connect_socket(request))
-                        .await
-                        .map_err(|_| anyhow!("Foundry websocket connection timed out"))?
-                        .map_err(|_| anyhow!("Foundry websocket connection failed"))?;
-                    timeout(
-                        SESSION_TIMEOUT,
-                        wait_for_session(&mut socket, &session, &userid),
-                    )
-                    .await
-                    .map_err(|_| anyhow!("Timed out waiting for Foundry session binding"))??;
-                    Ok(socket)
-                })
-                .await;
+        let action = operation
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("get")
+            .to_owned();
+        let requested = match action.as_str() {
+            "create" => operation.get("data").cloned(),
+            "update" => operation.get("updates").cloned(),
+            "delete" => operation.get("ids").cloned(),
+            _ => None,
+        };
+        let response = self
+            .connections
+            .exchange(
+                key,
+                socket_mux::Request::Document {
+                    document: document.to_owned(),
+                    action: action.clone(),
+                    operation,
+                },
+                "document",
+                || self.connect_for(credential),
+            )
+            .await?;
+        if action == "get" {
+            return response
+                .get("result")
+                .filter(|value| value.is_array())
+                .cloned()
+                .ok_or_else(|| anyhow!("Foundry document response has invalid result"));
         }
+        let requested = requested.ok_or_else(|| anyhow!("invalid document request"))?;
+        validate_write_ack(&response, &action, &requested)?;
+        Ok(response["result"].clone())
+    }
+
+    /// Authenticate and open the identity's websocket, verifying the session
+    /// binding before the connection is handed to the connection manager.
+    async fn connect_for(&self, credential: &FoundryCredential) -> Result<connection::Socket> {
         let (session, generation, userid) = self.session(credential).await?;
         let request = self.socket_request(&credential.hostname, &session, generation)?;
         let mut socket = timeout(SOCKET_CONNECT_TIMEOUT, connect_socket(request))
@@ -987,102 +1051,7 @@ impl FoundryClient {
         )
         .await
         .map_err(|_| anyhow!("Timed out waiting for Foundry session binding"))??;
-        if document == "World" {
-            send_message(
-                &mut socket,
-                Message::Text("420[\"world\"]".into()),
-                "sending Foundry world request",
-            )
-            .await?;
-            return timeout(RESPONSE_TIMEOUT, async {
-                loop {
-                    let frame = socket
-                        .next()
-                        .await
-                        .ok_or_else(|| anyhow!("Foundry socket closed"))?
-                        .map_err(|_| anyhow!("Foundry socket read failed"))?;
-                    if let Message::Text(text) = frame {
-                        if text == "2" {
-                            send_message(
-                                &mut socket,
-                                Message::Text("3".into()),
-                                "sending Foundry pong",
-                            )
-                            .await?;
-                        } else if text.starts_with("430") {
-                            return world_response(text.as_str());
-                        } else if is_namespace_disconnect_or_error(text.as_str()) {
-                            bail!("Foundry Socket.IO namespace disconnected or rejected the connection");
-                        }
-                    }
-                }
-            })
-            .await
-            .map_err(|_| anyhow!("Timed out waiting for Foundry world response"))?;
-        }
-        let ack = 1;
-        let action = operation
-            .get("action")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("missing document action"))?;
-        let payload =
-            json!(["modifyDocument", {"type": document, "action": action, "operation": operation}]);
-        send_message(
-            &mut socket,
-            Message::Text(format!("42{ack}{payload}").into()),
-            "sending Foundry document request; the operation may have been applied",
-        )
-        .await?;
-        timeout(RESPONSE_TIMEOUT, async {
-            let applied = if action == "get" {
-                String::new()
-            } else {
-                ", and the operation may have been applied".to_string()
-            };
-            loop {
-                let frame = socket
-                    .next()
-                    .await
-                    .ok_or_else(|| anyhow!("Foundry socket closed{applied}"))?
-                    .map_err(|_| anyhow!("Foundry socket read failed{applied}"))?;
-                if let Message::Text(text) = frame {
-                    if text == "2" {
-                        send_message(
-                            &mut socket,
-                            Message::Text("3".into()),
-                            "sending Foundry pong",
-                        )
-                        .await?;
-                        continue;
-                    }
-                    if is_namespace_disconnect_or_error(text.as_str()) {
-                        bail!("Foundry Socket.IO namespace disconnected or rejected the connection{applied}");
-                    }
-                    if let Some(response) =
-                        document_ack_response(text.as_str(), ack, document, action)?
-                    {
-                        if action != "get" {
-                            let key = match action {
-                                "create" => "data",
-                                "update" => "updates",
-                                "delete" => "ids",
-                                _ => bail!("unsupported document action"),
-                            };
-                            validate_write_ack(&response, action, &operation[key])?;
-                        }
-                        return Ok(response["result"].clone());
-                    }
-                }
-            }
-        })
-        .await
-        .map_err(|_| {
-            if action == "get" {
-                anyhow!("Timed out waiting for Foundry document response")
-            } else {
-                anyhow!("Timed out waiting for Foundry document response, and the operation may have been applied")
-            }
-        })?
+        Ok(socket)
     }
 
     pub async fn list_documents(
@@ -1316,39 +1285,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("duplicate"), "{error}");
-    }
-
-    #[test]
-    fn type_mismatch_keeps_waiting_and_read_errors_do_not_claim_applied() {
-        assert!(
-            document_ack_response("431[{\"type\":\"Item\",\"result\":[]}]", 1, "Actor", "get")
-                .unwrap()
-                .is_none()
-        );
-        let read_error = document_ack_response(
-            "431[{\"type\":\"Actor\",\"error\":{\"message\":\"denied\"}}]",
-            1,
-            "Actor",
-            "get",
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            !read_error.contains("may have been applied"),
-            "{read_error}"
-        );
-        let write_error = document_ack_response(
-            "431[{\"type\":\"Actor\",\"error\":{\"message\":\"denied\"}}]",
-            1,
-            "Actor",
-            "update",
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            write_error.contains("may have been applied"),
-            "{write_error}"
-        );
     }
 
     #[test]
@@ -1596,12 +1532,6 @@ mod tests {
     }
 
     #[test]
-    fn emits_upstream_modify_document_operation_shape() {
-        let message = document_request(17, "Actor", json!({"folder":"f1"}));
-        assert_eq!(message, "4217[\"modifyDocument\",{\"action\":\"get\",\"operation\":{\"action\":\"get\",\"broadcast\":false,\"index\":false,\"query\":{\"folder\":\"f1\"}},\"type\":\"Actor\"}]");
-    }
-
-    #[test]
     fn builds_write_operations_with_reference_protocol_fields() {
         let options = DocumentOptions {
             parent_uuid: Some("Actor.a".into()),
@@ -1629,12 +1559,6 @@ mod tests {
             delete,
             json!({"action":"delete","pack":null,"ids":["i"],"modifiedTime":123,"deleteAll":false,"render":true})
         );
-    }
-
-    #[test]
-    fn write_ack_reports_errors_without_type_and_rejects_invalid_result() {
-        assert!(document_ack("431[{\"error\":{\"message\":\"denied\"}}]", 1, "Actor").is_err());
-        assert!(document_ack("431[{\"type\":\"Actor\",\"result\":null}]", 1, "Actor").is_err());
     }
 
     #[test]
@@ -1682,36 +1606,6 @@ mod tests {
             &update
         )
         .is_ok());
-    }
-
-    #[test]
-    fn preserves_foundry_decimal_in_document_ack() {
-        let frame = r#"431[{"type":"Actor","result":[{"scaleX":0.9615384615384615}]}]"#;
-        let result = document_ack(frame, 1, "Actor").unwrap().unwrap();
-        assert_eq!(result.to_string(), r#"[{"scaleX":0.9615384615384615}]"#);
-    }
-
-    #[test]
-    fn parses_ack_only_for_matching_id_and_extracts_result() {
-        assert_eq!(
-            document_ack(
-                "431[ {\"type\":\"Actor\",\"result\":[{\"_id\":\"a\"}]}]",
-                1,
-                "Actor"
-            )
-            .unwrap(),
-            Some(json!([{"_id":"a"}]))
-        );
-        assert_eq!(
-            document_ack("432[{\"type\":\"Actor\",\"result\":[]}]", 1, "Actor").unwrap(),
-            None
-        );
-        assert!(document_ack(
-            "431[{\"type\":\"Actor\",\"error\":{\"message\":\"denied\"}}]",
-            1,
-            "Actor"
-        )
-        .is_err());
     }
 
     #[test]
@@ -1825,17 +1719,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_upstream_world_response_and_world_metadata() {
-        let world = world_response(
-            "430[{\"meta\":{\"title\":\"My World\",\"system\":\"dnd5e\",\"version\":\"1.0\"}}]",
-        )
-        .unwrap();
-        assert_eq!(
-            world,
-            json!({"meta":{"title":"My World","system":"dnd5e","version":"1.0"}})
-        );
+    fn reads_world_metadata_from_the_world_payload() {
+        let world = json!({"meta":{"title":"My World","system":"dnd5e","version":"1.0"}});
         let info = world_info(&world);
         assert_eq!(info.title.as_deref(), Some("My World"));
-        assert!(world_response("430[]").is_err());
+        assert_eq!(info.system.as_deref(), Some("dnd5e"));
     }
 }

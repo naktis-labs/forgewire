@@ -11,12 +11,17 @@ cargo test --locked --offline --workspace
 
 The server test constructs the real `FoundryClient`, drives the MCP router with
 `get_journals` and `get_journal`, and checks the fake world's HTTP and Socket.IO
-request log. The fake world listens only on an ephemeral `127.0.0.1` port; the
-loopback client ignores proxy settings and cannot target a remote host. The
-fixture is entirely in memory and requires no `FOUNDRY_*` variables. Dropping
-the world stops its listener. This is a limited protocol simulation, not proof
-of compatibility with any real Foundry release. It does not implement a full
-Foundry world or verify writes, uploads, or arbitrary compendiums.
+request log. A second test drives an authenticated change through the REST
+write route against the same disposable world and checks that the read and the
+change shared one authenticated socket. A third test drops the socket during
+a change and checks that the REST route reports the unknown outcome as
+`502` with `"outcome": "possibly_applied"`. The fake world listens only on an
+ephemeral `127.0.0.1` port; the loopback client ignores proxy settings and
+cannot target a remote host. The fixture is entirely in memory and requires no
+`FOUNDRY_*` variables. Dropping the world stops its listener. This is a limited
+protocol simulation, not proof of compatibility with any real Foundry release.
+It does not implement a full Foundry world, and it does not verify uploads or
+arbitrary compendiums.
 
 ## Real disposable world (manual, separate environment)
 

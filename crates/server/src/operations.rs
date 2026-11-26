@@ -553,6 +553,11 @@ pub enum OperationError {
     NotFound(anyhow::Error),
     /// Contacting Foundry or interpreting its response failed.
     Upstream(anyhow::Error),
+    /// A change may have been applied. The request reached Foundry, but the
+    /// answer does not prove whether the change took effect, so the caller
+    /// learns the outcome by reading the affected document again. The
+    /// change is never replayed.
+    PotentiallyApplied(anyhow::Error),
 }
 
 impl OperationError {
@@ -567,7 +572,8 @@ impl std::fmt::Display for OperationError {
             OperationError::Forbidden(e)
             | OperationError::Invalid(e)
             | OperationError::NotFound(e)
-            | OperationError::Upstream(e) => e.fmt(f),
+            | OperationError::Upstream(e)
+            | OperationError::PotentiallyApplied(e) => e.fmt(f),
         }
     }
 }
@@ -578,7 +584,8 @@ impl std::error::Error for OperationError {
             OperationError::Forbidden(e)
             | OperationError::Invalid(e)
             | OperationError::NotFound(e)
-            | OperationError::Upstream(e) => e.source(),
+            | OperationError::Upstream(e)
+            | OperationError::PotentiallyApplied(e) => e.source(),
         }
     }
 }
@@ -597,6 +604,28 @@ fn ensure_writes_allowed(policy: WritePolicy) -> Result<(), OperationError> {
         )));
     }
     Ok(())
+}
+
+/// Classify a failure from a change.
+///
+/// A change whose outcome is unknown is its own outcome, not a plain upstream
+/// failure: the caller must learn whether the change took effect by reading
+/// the document again, and the change is never replayed. Caller input the
+/// connector refused never reached Foundry, so it is a caller mistake.
+fn classify_change_failure(error: anyhow::Error) -> OperationError {
+    if error
+        .downcast_ref::<foundry_connector::AmbiguousMutation>()
+        .is_some()
+    {
+        return OperationError::PotentiallyApplied(error);
+    }
+    if error
+        .downcast_ref::<foundry_connector::InvalidInput>()
+        .is_some()
+    {
+        return OperationError::Invalid(error);
+    }
+    OperationError::Upstream(error)
 }
 
 /// Classify a failure from the shared read path's connector call. An unknown
@@ -674,15 +703,15 @@ pub async fn write_document(
         "create_document" => client
             .create_document(target, kind, data, parent, pack)
             .await
-            .map_err(OperationError::Upstream),
+            .map_err(classify_change_failure),
         "modify_document" => client
             .modify_document(target, kind, id.unwrap(), data, parent, pack)
             .await
-            .map_err(OperationError::Upstream),
+            .map_err(classify_change_failure),
         "delete_document" => client
             .delete_document(target, kind, ids, parent, pack)
             .await
-            .map_err(OperationError::Upstream),
+            .map_err(classify_change_failure),
         _ => Err(OperationError::invalid("unknown operation")),
     }
 }
@@ -718,14 +747,14 @@ pub async fn compendium(
                         required_string(args, "type").map_err(OperationError::Invalid)?,
                     )
                     .await
-                    .map_err(OperationError::Upstream),
+                    .map_err(classify_change_failure),
                 _ => client
                     .delete_compendium(
                         target,
                         required_string(args, "name").map_err(OperationError::Invalid)?,
                     )
                     .await
-                    .map_err(OperationError::Upstream),
+                    .map_err(classify_change_failure),
             }
         }
         _ => Err(OperationError::invalid("unknown compendium tool")),
@@ -820,7 +849,7 @@ pub async fn upload_file(
     client
         .upload_file(target, path, filename, &data)
         .await
-        .map_err(OperationError::Upstream)
+        .map_err(classify_change_failure)
 }
 
 pub fn rest_read_args(query: &std::collections::HashMap<String, String>) -> Result<Value> {

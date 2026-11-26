@@ -877,6 +877,579 @@ async fn malformed_join_data_fails_closed_even_for_complete_identity() {
     assert!(error.contains("did not contain users"), "{error}");
 }
 
+/// How many websockets the world has seen. Every connection establishment
+/// opens one, so a second operation that does not raise this count reused
+/// the identity's authenticated connection.
+fn socket_count(fake: &FakeFoundry) -> usize {
+    fake.state
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.starts_with("WS cookie_present="))
+        .count()
+}
+
+#[tokio::test]
+async fn mutations_share_the_identity_connection_instead_of_opening_a_socket_per_change() {
+    let fake = FakeFoundry::start_canned("430[{\"world\":{}}]", 14, "s-test").await;
+    let client = FoundryClient::for_test(&fake.base_url).unwrap();
+    let credential = test_credential(&fake.base_url);
+
+    client.list_documents(&credential, "actors").await.unwrap();
+    let after_read = socket_count(&fake);
+
+    let created = client
+        .create_document(
+            &credential,
+            "Actor",
+            vec![json!({"name": "Interop Hero"})],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(created[0]["_id"], "created-0");
+
+    let modified = client
+        .modify_document(
+            &credential,
+            "Actor",
+            "actor-1",
+            vec![json!({"name": "Renamed"})],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(modified[0]["_id"], "actor-1");
+
+    let deleted = client
+        .delete_document(&credential, "Actor", vec!["actor-1".to_owned()], None, None)
+        .await
+        .unwrap();
+    assert_eq!(deleted[0], "actor-1");
+
+    assert_eq!(
+        socket_count(&fake),
+        after_read,
+        "a change opened a socket instead of reusing the connection: {:?}",
+        fake.request_log()
+    );
+}
+
+#[tokio::test]
+async fn compendium_management_shares_the_identity_connection() {
+    let fake = FakeFoundry::start_canned("430[{\"world\":{}}]", 14, "s-test").await;
+    let client = FoundryClient::for_test(&fake.base_url).unwrap();
+    let credential = test_credential(&fake.base_url);
+
+    client.list_documents(&credential, "actors").await.unwrap();
+    let after_read = socket_count(&fake);
+
+    let created = client
+        .create_compendium(&credential, "NPCs", "Actor")
+        .await
+        .unwrap();
+    assert_eq!(created["result"]["id"], "world.created-pack");
+    let removed = client
+        .delete_compendium(&credential, "world.npcs")
+        .await
+        .unwrap();
+    assert_eq!(removed["result"], "world.deleted-pack");
+
+    assert_eq!(
+        socket_count(&fake),
+        after_read,
+        "a compendium change opened a socket: {:?}",
+        fake.request_log()
+    );
+}
+
+#[tokio::test]
+async fn file_browsing_shares_the_identity_connection() {
+    let fake = FakeFoundry::start_canned("430[{\"world\":{}}]", 14, "s-test").await;
+    let client = FoundryClient::for_test(&fake.base_url).unwrap();
+    let credential = test_credential(&fake.base_url);
+
+    client.list_documents(&credential, "actors").await.unwrap();
+    let after_read = socket_count(&fake);
+
+    let browsed = client
+        .browse_files(&credential, "worlds/test", None, None)
+        .await
+        .unwrap();
+    assert_eq!(browsed["dirs"][0]["name"], "worlds");
+
+    assert_eq!(
+        socket_count(&fake),
+        after_read,
+        "a browse opened a socket: {:?}",
+        fake.request_log()
+    );
+}
+
+#[tokio::test]
+async fn a_read_and_a_change_in_flight_share_one_socket_and_answer_separately() {
+    let fake = FakeFoundry::start_canned("430[{\"world\":{}}]", 14, "s-test").await;
+    let client = FoundryClient::for_test(&fake.base_url).unwrap();
+    let credential = test_credential(&fake.base_url);
+
+    let (read, change) = tokio::join!(
+        client.list_documents(&credential, "actors"),
+        client.create_document(
+            &credential,
+            "Actor",
+            vec![json!({"name": "Hero"})],
+            None,
+            None
+        ),
+    );
+    assert_eq!(read.unwrap()[0]["name"], "Actor");
+    assert_eq!(change.unwrap()[0]["_id"], "created-0");
+
+    let requests = fake.state.requests.lock().unwrap();
+    let sockets: std::collections::HashSet<_> = requests
+        .iter()
+        .filter(|request| request.contains("modifyDocument"))
+        .filter_map(|request| request.split("socket=").nth(1))
+        .collect();
+    assert_eq!(
+        sockets.len(),
+        1,
+        "a read and a change used separate sockets: {requests:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_disconnect_during_a_change_reports_that_it_may_have_been_applied() {
+    let fake = FakeFoundry::start_canned("430[{\"world\":{}}]", 14, "s-test").await;
+    fake.state
+        .disconnect_on_mutation
+        .store(true, Ordering::Release);
+    let client = FoundryClient::for_test(&fake.base_url).unwrap();
+    let credential = test_credential(&fake.base_url);
+
+    let error = client
+        .create_document(
+            &credential,
+            "Actor",
+            vec![json!({"name": "Hero"})],
+            None,
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("may have been applied"), "{error}");
+}
+
+#[tokio::test]
+async fn a_slow_connection_establishment_does_not_consume_the_world_request_budget() {
+    let fake = FakeFoundry::start_canned("430[{\"world\":{}}]", 14, "s-test").await;
+    fake.state.auth_delay_ms.store(400, Ordering::Relaxed);
+    let policy = crate::connection::ReconnectPolicy {
+        attempts: 1,
+        initial_delay: std::time::Duration::ZERO,
+        max_delay: std::time::Duration::ZERO,
+        max_jitter: std::time::Duration::ZERO,
+        attempt_timeout: std::time::Duration::from_secs(30),
+        total_timeout: std::time::Duration::from_secs(30),
+        world_gate_timeout: std::time::Duration::from_millis(200),
+    };
+    let manager = std::sync::Arc::new(crate::connection::ConnectionManager::with_policy(
+        4,
+        std::time::Duration::from_secs(60),
+        policy,
+    ));
+    let client = FoundryClient::for_test_with_connections(&fake.base_url, manager).unwrap();
+    let credential = test_credential(&fake.base_url);
+
+    let (first, second) = tokio::join!(client.world(&credential), client.world(&credential));
+
+    assert!(
+        first.is_ok(),
+        "the first world request failed: {:?}",
+        first.err()
+    );
+    assert!(
+        second.is_ok(),
+        "the second world request failed: {:?}",
+        second.err()
+    );
+}
+
+#[tokio::test]
+async fn an_upstream_refusal_leaves_the_shared_connection_usable() {
+    let fake = FakeFoundry::start_canned("430[{\"world\":{}}]", 14, "s-test").await;
+    *fake.state.error_document.lock().unwrap() = Some("Actor".to_owned());
+    let client = FoundryClient::for_test(&fake.base_url).unwrap();
+    let credential = test_credential(&fake.base_url);
+
+    let error = client
+        .list_documents(&credential, "actors")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("denied"), "{error}");
+    assert!(
+        !error.contains("may have been applied"),
+        "a refused read must not claim to be applied: {error}"
+    );
+
+    let after = socket_count(&fake);
+    let items = client.list_documents(&credential, "items").await.unwrap();
+    assert_eq!(items[0]["name"], "Item");
+    assert_eq!(
+        socket_count(&fake),
+        after,
+        "an upstream refusal tore down the shared connection: {:?}",
+        fake.request_log()
+    );
+}
+
+#[tokio::test]
+async fn a_retry_after_hint_is_honored_before_the_next_attempt() {
+    let fake = FakeFoundry::start_canned("430[{\"world\":{}}]", 14, "s-test").await;
+    fake.state
+        .auth_transient_status
+        .store(503, Ordering::Release);
+    fake.state
+        .auth_transient_attempts
+        .store(1, Ordering::Release);
+    fake.state
+        .auth_retry_after_seconds
+        .store(1, Ordering::Release);
+    let client = FoundryClient::for_test(&fake.base_url).unwrap();
+    let credential = test_credential(&fake.base_url);
+
+    let started = std::time::Instant::now();
+    let documents = client.list_documents(&credential, "actors").await.unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(documents[0]["name"], "Actor");
+    assert!(
+        elapsed >= std::time::Duration::from_millis(950),
+        "the upstream hint was not honored: {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_retry_after_hint_does_not_hide_the_upstream_failure() {
+    let fake = FakeFoundry::start_canned("430[{\"world\":{}}]", 14, "s-test").await;
+    fake.state
+        .auth_transient_status
+        .store(503, Ordering::Release);
+    fake.state
+        .auth_transient_attempts
+        .store(5, Ordering::Release);
+    fake.state
+        .auth_retry_after_seconds
+        .store(1, Ordering::Release);
+    let policy = crate::connection::ReconnectPolicy {
+        attempts: 1,
+        initial_delay: std::time::Duration::ZERO,
+        max_delay: std::time::Duration::ZERO,
+        max_jitter: std::time::Duration::ZERO,
+        attempt_timeout: std::time::Duration::from_secs(30),
+        total_timeout: std::time::Duration::from_secs(30),
+        world_gate_timeout: std::time::Duration::from_secs(30),
+    };
+    let manager = std::sync::Arc::new(crate::connection::ConnectionManager::with_policy(
+        4,
+        std::time::Duration::from_secs(60),
+        policy,
+    ));
+    let client = FoundryClient::for_test_with_connections(&fake.base_url, manager).unwrap();
+    let credential = test_credential(&fake.base_url);
+
+    let error = client
+        .list_documents(&credential, "actors")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("transient status 503"),
+        "the hint hid the upstream failure: {error}"
+    );
+    assert!(error.contains("retry after"), "{error}");
+}
+
+#[tokio::test]
+async fn an_unsuccessful_session_request_is_terminal_and_not_retried() {
+    let fake = FakeFoundry::start_canned("430[{\"world\":{}}]", 14, "s-test").await;
+    fake.state.join_status.store(403, Ordering::Release);
+    let client = FoundryClient::for_test(&fake.base_url).unwrap();
+    let credential = test_credential(&fake.base_url);
+
+    let error = client
+        .list_documents(&credential, "actors")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("unsuccessful status 403"), "{error}");
+    let joins = fake
+        .request_log()
+        .iter()
+        .filter(|request| request.starts_with("GET /join"))
+        .count();
+    assert_eq!(joins, 1, "a refused session request was retried");
+}
+
+#[tokio::test]
+async fn a_world_request_that_waited_through_a_broken_socket_retries_on_the_new_one() {
+    let fake = FakeFoundry::start_canned("430[{\"world\":{}}]", 14, "s-test").await;
+    fake.state.world_delay_ms.store(400, Ordering::Release);
+    fake.state
+        .disconnect_on_mutation
+        .store(true, Ordering::Release);
+    let client = std::sync::Arc::new(FoundryClient::for_test(&fake.base_url).unwrap());
+    let credential = test_credential(&fake.base_url);
+
+    // The first world request holds the world slot of the connection while
+    // its answer is delayed.
+    let first = tokio::spawn({
+        let client = client.clone();
+        let credential = credential.clone();
+        async move { client.world(&credential).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // The second world request takes its snapshot of the connection and then
+    // waits for the world slot.
+    let second = tokio::spawn({
+        let client = client.clone();
+        let credential = credential.clone();
+        async move { client.world(&credential).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // A change that loses the socket breaks the connection the two world
+    // requests share.
+    let broken = client
+        .create_document(
+            &credential,
+            "Actor",
+            vec![json!({"name": "Hero"})],
+            None,
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(broken.contains("may have been applied"), "{broken}");
+
+    assert!(
+        first.await.unwrap().is_err(),
+        "the world request on the broken socket should fail"
+    );
+    let world = second.await.unwrap().expect("the waiting world request");
+    assert_eq!(world.title.as_deref(), None, "{world:?}");
+}
+
+#[tokio::test]
+async fn a_refusal_while_another_request_is_in_flight_leaves_that_request_alone() {
+    let fake = FakeFoundry::start_canned("430[{\"world\":{}}]", 14, "s-test").await;
+    *fake.state.error_document.lock().unwrap() = Some("Actor".to_owned());
+    fake.state.hold_document_acks.store(true, Ordering::Release);
+    let client = std::sync::Arc::new(FoundryClient::for_test(&fake.base_url).unwrap());
+    let credential = test_credential(&fake.base_url);
+
+    // A read of another document type is in flight, and the world holds its
+    // answer.
+    let held = tokio::spawn({
+        let client = client.clone();
+        let credential = credential.clone();
+        async move { client.list_documents(&credential, "items").await }
+    });
+    fake.state
+        .document_requests
+        .acquire()
+        .await
+        .unwrap()
+        .forget();
+
+    let sockets = socket_count(&fake);
+    let error = client
+        .list_documents(&credential, "actors")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("denied"), "{error}");
+    assert_eq!(
+        socket_count(&fake),
+        sockets,
+        "the refusal tore down the shared connection: {:?}",
+        fake.request_log()
+    );
+
+    fake.state.release_document_acks.add_permits(128);
+    let items = held.await.unwrap().expect("the request in flight");
+    assert_eq!(items[0]["name"], "Item");
+}
+
+#[tokio::test]
+async fn a_transport_failure_invalidates_the_connection_for_the_next_request() {
+    let fake = FakeFoundry::start_canned("430[{\"world\":{}}]", 14, "s-test").await;
+    fake.state
+        .disconnect_on_mutation
+        .store(true, Ordering::Release);
+    let client = FoundryClient::for_test(&fake.base_url).unwrap();
+    let credential = test_credential(&fake.base_url);
+
+    let before = socket_count(&fake);
+    let error = client
+        .create_document(
+            &credential,
+            "Actor",
+            vec![json!({"name": "Hero"})],
+            None,
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("may have been applied"), "{error}");
+
+    let documents = client.list_documents(&credential, "actors").await.unwrap();
+    assert_eq!(documents[0]["name"], "Actor");
+    assert!(
+        socket_count(&fake) > before,
+        "the broken connection was kept: {:?}",
+        fake.request_log()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_hint_from_an_earlier_attempt_does_not_delay_a_later_attempt() {
+    let fake = FakeFoundry::start_canned("430[{\"world\":{}}]", 14, "s-test").await;
+    fake.state
+        .auth_transient_status
+        .store(503, Ordering::Release);
+    fake.state
+        .auth_transient_attempts
+        .store(1, Ordering::Release);
+    fake.state
+        .auth_retry_after_seconds
+        .store(2, Ordering::Release);
+    fake.state.auth_hang_attempts.store(1, Ordering::Release);
+    let policy = crate::connection::ReconnectPolicy {
+        attempts: 3,
+        initial_delay: std::time::Duration::from_millis(50),
+        max_delay: std::time::Duration::from_millis(50),
+        max_jitter: std::time::Duration::ZERO,
+        attempt_timeout: std::time::Duration::from_secs(1),
+        total_timeout: std::time::Duration::from_secs(30),
+        world_gate_timeout: std::time::Duration::from_secs(30),
+    };
+    let manager = std::sync::Arc::new(crate::connection::ConnectionManager::with_policy(
+        4,
+        std::time::Duration::from_secs(60),
+        policy,
+    ));
+    let client = FoundryClient::for_test_with_connections(&fake.base_url, manager).unwrap();
+    let credential = test_credential(&fake.base_url);
+
+    // The clock is virtual, so the measured delay is the one the reconnect
+    // loop asked for, not the machine's load.
+    let started = tokio::time::Instant::now();
+    let documents = client.list_documents(&credential, "actors").await.unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(documents[0]["name"], "Actor");
+    assert!(
+        elapsed < std::time::Duration::from_secs(4),
+        "a hint from an earlier attempt delayed a later one: {elapsed:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_retry_after_hint_longer_than_the_cap_waits_only_the_cap() {
+    let fake = FakeFoundry::start_canned("430[{\"world\":{}}]", 14, "s-test").await;
+    fake.state
+        .auth_transient_status
+        .store(503, Ordering::Release);
+    fake.state
+        .auth_transient_attempts
+        .store(1, Ordering::Release);
+    fake.state
+        .auth_retry_after_seconds
+        .store(3600, Ordering::Release);
+    let policy = crate::connection::ReconnectPolicy {
+        attempts: 2,
+        initial_delay: std::time::Duration::from_millis(50),
+        max_delay: std::time::Duration::from_millis(50),
+        max_jitter: std::time::Duration::ZERO,
+        attempt_timeout: std::time::Duration::from_secs(30),
+        total_timeout: std::time::Duration::from_secs(300),
+        world_gate_timeout: std::time::Duration::from_secs(30),
+    };
+    let manager = std::sync::Arc::new(crate::connection::ConnectionManager::with_policy(
+        4,
+        std::time::Duration::from_secs(60),
+        policy,
+    ));
+    let client = FoundryClient::for_test_with_connections(&fake.base_url, manager).unwrap();
+    let credential = test_credential(&fake.base_url);
+
+    let started = tokio::time::Instant::now();
+    let documents = client.list_documents(&credential, "actors").await.unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(documents[0]["name"], "Actor");
+    assert!(
+        elapsed < std::time::Duration::from_secs(120),
+        "the upstream hint was not capped: {elapsed:?}"
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_secs(60),
+        "the capped hint was not waited for: {elapsed:?}"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_reconnect_stops_at_its_aggregate_deadline() {
+    let fake = FakeFoundry::start_canned("430[{\"world\":{}}]", 14, "s-test").await;
+    fake.state
+        .auth_transient_status
+        .store(503, Ordering::Release);
+    fake.state
+        .auth_transient_attempts
+        .store(10, Ordering::Release);
+    fake.state
+        .auth_retry_after_seconds
+        .store(60, Ordering::Release);
+    let policy = crate::connection::ReconnectPolicy {
+        attempts: 5,
+        initial_delay: std::time::Duration::from_millis(50),
+        max_delay: std::time::Duration::from_millis(50),
+        max_jitter: std::time::Duration::ZERO,
+        attempt_timeout: std::time::Duration::from_secs(30),
+        total_timeout: std::time::Duration::from_secs(5),
+        world_gate_timeout: std::time::Duration::from_secs(30),
+    };
+    let manager = std::sync::Arc::new(crate::connection::ConnectionManager::with_policy(
+        4,
+        std::time::Duration::from_secs(60),
+        policy,
+    ));
+    let client = FoundryClient::for_test_with_connections(&fake.base_url, manager).unwrap();
+    let credential = test_credential(&fake.base_url);
+
+    let started = tokio::time::Instant::now();
+    let error = client
+        .list_documents(&credential, "actors")
+        .await
+        .unwrap_err()
+        .to_string();
+    let elapsed = started.elapsed();
+    assert!(
+        error.contains("deadline"),
+        "the reconnect ignored its deadline: {error}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(30),
+        "the reconnect outlasted its deadline: {elapsed:?}"
+    );
+}
+
 fn test_credential(hostname: &str) -> FoundryCredential {
     FoundryCredential {
         id: Some("test-id".into()),

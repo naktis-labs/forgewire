@@ -146,14 +146,29 @@ fn rest_error(status: StatusCode, error: impl ToString) -> (StatusCode, Json<Val
 /// Map the shared typed operation error to REST status codes: caller mistakes
 /// are 400/404, policy gates are 403, and only Foundry contact or response
 /// failures are 502.
+///
+/// A change whose outcome is unknown stays a 502 — the upstream did not give
+/// a definitive answer — but the envelope says so in a machine-readable way,
+/// so a caller can tell it apart from a change that certainly did not happen
+/// and read the affected document instead of replaying the change.
 fn operation_status(error: operations::OperationError) -> (StatusCode, Json<Value>) {
     let status = match &error {
         operations::OperationError::Invalid(_) => StatusCode::BAD_REQUEST,
         operations::OperationError::NotFound(_) => StatusCode::NOT_FOUND,
         operations::OperationError::Forbidden(_) => StatusCode::FORBIDDEN,
         operations::OperationError::Upstream(_) => StatusCode::BAD_GATEWAY,
+        operations::OperationError::PotentiallyApplied(_) => StatusCode::BAD_GATEWAY,
     };
-    rest_error(status, error)
+    match error {
+        operations::OperationError::PotentiallyApplied(error) => (
+            status,
+            Json(json!({
+                "error": error.to_string(),
+                "outcome": "possibly_applied",
+            })),
+        ),
+        error => rest_error(status, error),
+    }
 }
 
 async fn rest_documents(
@@ -1167,6 +1182,12 @@ mod tests {
             ),
             (
                 operations::OperationError::Upstream(anyhow::anyhow!("socket failed")),
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                operations::OperationError::PotentiallyApplied(anyhow::anyhow!(
+                    "change may have been applied"
+                )),
                 StatusCode::BAD_GATEWAY,
             ),
         ] {

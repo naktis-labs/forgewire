@@ -1,58 +1,15 @@
 use anyhow::{anyhow, bail, Result};
-use futures_util::StreamExt;
 use rand::RngCore;
 use serde_json::{json, Value};
-use tokio::time::timeout;
-use tokio_tungstenite::tungstenite::protocol::Message;
 
-use crate::{
-    wait_for_session, FoundryClient, FoundryCredential, RESPONSE_TIMEOUT, SESSION_TIMEOUT,
-    SOCKET_CONNECT_TIMEOUT,
-};
+use crate::{FoundryClient, FoundryCredential};
 
 pub const MAX_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
-const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+/// The largest browse response the gateway accepts.
+pub(crate) const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const IMAGE_EXTENSIONS: &[&str] = &[
     ".apng", ".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".svg", ".tiff", ".webp",
 ];
-
-fn browse_request(
-    id: u64,
-    target: &str,
-    kind: Option<&str>,
-    extensions: Option<&[String]>,
-) -> String {
-    let extensions = extensions
-        .map(|v| json!(v))
-        .unwrap_or_else(|| json!(IMAGE_EXTENSIONS));
-    format!(
-        "42{id}{}",
-        json!(["manageFiles", {"action":"browseFiles", "storage":"data", "target":target}, {"type":kind.unwrap_or("image"), "extensions":extensions, "wildcard":false, "render":true}])
-    )
-}
-
-fn browse_ack(frame: &str, id: u64) -> Result<Option<Value>> {
-    let prefix = format!("43{id}[");
-    if !frame.starts_with(&prefix) {
-        return Ok(None);
-    }
-    let values: Value = serde_json::from_str(&frame[prefix.len() - 1..])
-        .map_err(|_| anyhow!("invalid Foundry browse ACK"))?;
-    let response = values
-        .get(0)
-        .filter(|v| v.is_object())
-        .ok_or_else(|| anyhow!("empty Foundry browse ACK"))?;
-    if let Some(error) = response
-        .get("error")
-        .filter(|v| !v.is_null() && *v != &json!(false))
-    {
-        bail!("Foundry browse failed: {error}");
-    }
-    if !response.get("dirs").is_some_and(Value::is_array) {
-        bail!("invalid Foundry browse response");
-    }
-    Ok(Some(response.clone()))
-}
 
 fn validate_upload(target: &str, filename: &str, size: usize) -> Result<()> {
     if target.len() > 4096
@@ -61,7 +18,7 @@ fn validate_upload(target: &str, filename: &str, size: usize) -> Result<()> {
         || target.chars().any(char::is_control)
         || target.split('/').any(|p| p == "." || p == "..")
     {
-        bail!("invalid upload target");
+        return Err(crate::invalid_input("invalid upload target"));
     }
     if filename.is_empty()
         || filename.len() > 255
@@ -71,10 +28,10 @@ fn validate_upload(target: &str, filename: &str, size: usize) -> Result<()> {
             .chars()
             .any(|c| c.is_control() || matches!(c, '/' | '\\' | '"'))
     {
-        bail!("invalid upload filename");
+        return Err(crate::invalid_input("invalid upload filename"));
     }
     if size > MAX_UPLOAD_BYTES {
-        bail!("upload exceeds maximum size");
+        return Err(crate::invalid_input("upload exceeds maximum size"));
     }
     Ok(())
 }
@@ -125,6 +82,10 @@ fn parse_upload_response(bytes: &[u8]) -> Result<Value> {
 }
 
 impl FoundryClient {
+    /// Browse a Foundry file directory over the identity's persistent
+    /// connection. The acknowledgement id identifies the request, so a browse
+    /// shares the connection with reads and with other operations instead of
+    /// opening a socket per operation.
     pub async fn browse_files(
         &self,
         credential: &FoundryCredential,
@@ -132,58 +93,25 @@ impl FoundryClient {
         kind: Option<&str>,
         extensions: Option<&[String]>,
     ) -> Result<Value> {
-        let (session, generation, userid) = self.session(credential).await?;
-        let request = self.socket_request(&credential.hostname, &session, generation)?;
-        let mut socket = timeout(SOCKET_CONNECT_TIMEOUT, crate::connect_socket(request))
+        let extensions = extensions.map(<[String]>::to_vec).unwrap_or_else(|| {
+            IMAGE_EXTENSIONS
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect()
+        });
+        let key = crate::identity_key(credential);
+        self.connections
+            .exchange(
+                key,
+                crate::socket_mux::Request::Files {
+                    target: target.to_owned(),
+                    kind: kind.unwrap_or("image").to_owned(),
+                    extensions,
+                },
+                "files",
+                || self.connect_for(credential),
+            )
             .await
-            .map_err(|_| anyhow!("Foundry websocket connection timed out"))?
-            .map_err(|_| anyhow!("Foundry websocket connection failed"))?;
-        timeout(
-            SESSION_TIMEOUT,
-            wait_for_session(&mut socket, &session, &userid),
-        )
-        .await
-        .map_err(|_| anyhow!("Timed out waiting for Foundry session binding"))??;
-        let id = 1;
-        crate::send_message(
-            &mut socket,
-            Message::Text(browse_request(id, target, kind, extensions).into()),
-            "sending Foundry browse request",
-        )
-        .await?;
-        timeout(RESPONSE_TIMEOUT, async {
-            loop {
-                let frame = socket
-                    .next()
-                    .await
-                    .ok_or_else(|| anyhow!("Foundry socket closed"))?
-                    .map_err(|_| anyhow!("Foundry socket read failed"))?;
-                if let Message::Text(text) = frame {
-                    if text.len() > MAX_RESPONSE_BYTES {
-                        bail!("Foundry browse response too large");
-                    }
-                    if text == "2" {
-                        crate::send_message(
-                            &mut socket,
-                            Message::Text("3".into()),
-                            "sending Foundry pong",
-                        )
-                        .await?;
-                        continue;
-                    }
-                    if crate::is_namespace_disconnect_or_error(text.as_str()) {
-                        bail!(
-                            "Foundry Socket.IO namespace disconnected or rejected the connection"
-                        );
-                    }
-                    if let Some(response) = browse_ack(text.as_str(), id)? {
-                        return Ok(response);
-                    }
-                }
-            }
-        })
-        .await
-        .map_err(|_| anyhow!("Timed out waiting for Foundry browse response"))?
     }
 
     /// Upload already-decoded bytes. URL fetching is deliberately unsupported.
@@ -221,55 +149,38 @@ impl FoundryClient {
             .send()
             .await
             .map_err(|_| {
-                anyhow!("Foundry upload request failed; the upload may have been applied")
+                crate::ambiguous_mutation(
+                    "Foundry upload request failed; the upload may have been applied",
+                )
             })?;
         let status = response.status();
         let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(|_| {
-            anyhow!("Foundry upload response failed; the upload may have been applied")
+            crate::ambiguous_mutation(
+                "Foundry upload response failed; the upload may have been applied",
+            )
         })? {
             if chunk.len() > MAX_RESPONSE_BYTES.saturating_sub(bytes.len()) {
-                bail!("Foundry upload response too large; the upload may have been applied");
+                return Err(crate::ambiguous_mutation(
+                    "Foundry upload response too large; the upload may have been applied",
+                ));
             }
             bytes.extend_from_slice(&chunk);
         }
         if !status.is_success() {
-            bail!("Foundry upload failed with status {status}; the upload may have been applied");
+            return Err(crate::ambiguous_mutation(format!(
+                "Foundry upload failed with status {status}; the upload may have been applied"
+            )));
         }
-        parse_upload_response(&bytes)
-            .map_err(|error| anyhow!("{error}; the upload may have been applied"))
+        parse_upload_response(&bytes).map_err(|error| {
+            crate::ambiguous_mutation(format!("{error}; the upload may have been applied"))
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn browse_request_matches_upstream() {
-        let message = browse_request(7, "worlds/test", None, None);
-        assert_eq!(
-            message,
-            format!(
-                "427{}",
-                json!(["manageFiles", {"action":"browseFiles","storage":"data","target":"worlds/test"}, {"type":"image","extensions":[".apng",".avif",".bmp",".gif",".jpeg",".jpg",".png",".svg",".tiff",".webp"],"wildcard":false,"render":true}])
-            )
-        );
-    }
-
-    #[test]
-    fn browse_ack_checks_id_errors_and_shape() {
-        assert!(browse_ack("432[{\"dirs\":[]}]", 1).unwrap().is_none());
-        assert!(browse_ack("431[{\"error\":\"denied\"}]", 1).is_err());
-        assert!(browse_ack("431[{\"files\":[]}]", 1).is_err());
-        assert_eq!(
-            browse_ack("431[{\"dirs\":[],\"files\":[]}]", 1)
-                .unwrap()
-                .unwrap()["dirs"],
-            json!([])
-        );
-    }
 
     #[test]
     fn validates_upload_paths_and_size() {
@@ -281,6 +192,25 @@ mod tests {
         }
         assert!(validate_upload("worlds/test", "image.png", MAX_UPLOAD_BYTES + 1).is_err());
         assert!(validate_upload("worlds/test", "image.png", MAX_UPLOAD_BYTES).is_ok());
+    }
+
+    #[test]
+    fn a_refused_upload_is_caller_input_not_an_upstream_fault() {
+        // The caller is told it made a mistake, so the gateway answers 400
+        // instead of an upstream failure. This is the only place the
+        // connector produces that typed error.
+        for (target, name, size) in [
+            ("../x", "x.png", 1),
+            ("worlds/test", "../x", 1),
+            ("worlds/test", "image.png", MAX_UPLOAD_BYTES + 1),
+        ] {
+            let error = validate_upload(target, name, size).unwrap_err();
+            assert!(
+                error.downcast_ref::<crate::InvalidInput>().is_some(),
+                "{target} {name}: {error}"
+            );
+            assert!(error.downcast_ref::<crate::AmbiguousMutation>().is_none());
+        }
     }
 
     #[test]
