@@ -35,6 +35,8 @@ struct FakeConnector {
     write_result: Value,
     /// How a change fails, when the test asks for a failure.
     write_failure: Mutex<Option<WriteFailure>>,
+    /// How a read fails, when the test asks for a failure.
+    read_failure: Mutex<Option<WriteFailure>>,
     /// Signals that a gated world read has reached the connector.
     world_entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     /// Holds a world read until the test releases it.
@@ -88,6 +90,7 @@ impl FakeConnector {
             upload_result: json!({"path": "data/upload/song.mp3"}),
             write_result: json!([{"_id": "new-1"}]),
             write_failure: Mutex::new(None),
+            read_failure: Mutex::new(None),
             world_entered: Mutex::new(None),
             world_gate: Mutex::new(None),
             calls: Mutex::new(Vec::new()),
@@ -123,6 +126,14 @@ impl FakeConnector {
             .map(|failure| failure.error())
     }
 
+    /// The failure a read reports, when the test asked for one.
+    fn read_failure(&self) -> Option<anyhow::Error> {
+        self.read_failure
+            .lock()
+            .unwrap()
+            .map(|failure| failure.error())
+    }
+
     fn recorded(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
     }
@@ -139,6 +150,9 @@ impl FakeConnector {
 impl operations::Connector for FakeConnector {
     async fn world(&self, target: &FoundryCredential) -> anyhow::Result<Value> {
         self.record(format!("world:{}", target.hostname));
+        if let Some(failure) = self.read_failure() {
+            return Err(failure);
+        }
         let entered = self.world_entered.lock().unwrap().take();
         let gate = self.world_gate.lock().unwrap().take();
         if let Some(entered) = entered {
@@ -204,6 +218,9 @@ impl operations::Connector for FakeConnector {
             target.hostname,
             kind.unwrap_or("")
         ));
+        if let Some(failure) = self.read_failure() {
+            return Err(failure);
+        }
         let packs = self.compendiums.as_array().unwrap();
         Ok(json!(packs
             .iter()
@@ -1289,6 +1306,33 @@ async fn an_upstream_authentication_refusal_is_reported_as_an_upstream_fault() {
     assert_eq!(mcp["result"]["isError"], true, "{mcp}");
     assert_eq!(mcp_error_text(&mcp), rest["error"], "{mcp}");
     assert!(mcp["result"].get("structuredContent").is_none(), "{mcp}");
+}
+
+/// The instance refusing the gateway's credentials on a *read* is an
+/// upstream authentication failure, and the read paths classify it with the
+/// same classifier the change paths use. The two variants answer the same
+/// status today, so the classification is pinned here directly: a plain
+/// upstream fault would answer the same way and the difference would rot
+/// unnoticed.
+#[tokio::test]
+async fn a_read_the_instance_refuses_is_an_upstream_authentication_failure() {
+    let (_router, fake) = contract_app_with_token(true);
+    *fake.read_failure.lock().unwrap() = Some(WriteFailure::UpstreamAuthentication);
+    let target = credential("one", "one.example");
+
+    let error = operations::world(fake.as_ref(), &target).await.unwrap_err();
+    assert!(
+        matches!(error, operations::OperationError::UpstreamAuthentication(_)),
+        "the world read lost the refusal's kind: {error}"
+    );
+
+    let error = operations::read(fake.as_ref(), &target, "get_compendiums", &json!({}))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, operations::OperationError::UpstreamAuthentication(_)),
+        "the compendium listing lost the refusal's kind: {error}"
+    );
 }
 
 #[tokio::test]

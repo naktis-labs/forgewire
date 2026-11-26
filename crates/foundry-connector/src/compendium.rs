@@ -76,12 +76,22 @@ pub fn resolve_pack_name(packs: &Value, requested: &str) -> Result<String> {
                 "Compendium pack \"{requested}\" is not a world compendium and cannot be deleted."
             )));
         }
-        match pack
-            .get("name")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-        {
+        match pack.get("name").and_then(Value::as_str) {
+            // The name is used exactly as the world published it, so the
+            // name the delete carries and the name the verification looks
+            // for are the same string. A padded name is refused rather than
+            // trimmed: a trimmed candidate could name a *different* pack
+            // that publishes the trimmed form.
+            Some(name) if name.trim().is_empty() => {
+                return Err(crate::invalid_input(format!(
+                    "Compendium pack \"{requested}\" publishes an empty name, so it cannot be deleted."
+                )))
+            }
+            Some(name) if name != name.trim() => {
+                return Err(crate::invalid_input(format!(
+                    "Compendium pack \"{requested}\" publishes a padded name, so it cannot be deleted."
+                )))
+            }
             Some(name) => name.to_owned(),
             // The world did not publish this pack's name, so there is no
             // name the caller could have named it by. Nothing is inferred
@@ -357,6 +367,99 @@ mod tests {
             resolve_pack_name(&coinciding, "lore").unwrap(),
             "lore".to_owned()
         );
+    }
+
+    /// A padded name is refused: the trimmed form could be the name of a
+    /// different pack, and the delete carries a bare name.
+    #[test]
+    fn a_pack_whose_published_name_is_padded_is_not_deletable() {
+        let padded = json!([
+            {"id":"world.a","name":" lore ","label":"Lore","type":"Actor","packageType":"world"},
+            {"id":"world.b","name":"lore","label":"Other","type":"Actor","packageType":"world"},
+        ]);
+        let error = resolve_pack_name(&padded, "world.a")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("padded name"), "{error}");
+        // The pack that publishes the exact name stays deletable, and it is
+        // the pack the caller named.
+        assert_eq!(
+            resolve_pack_name(&padded, "world.b").unwrap(),
+            "lore".to_owned()
+        );
+    }
+
+    /// The invariant every delete rests on: whenever a reference resolves,
+    /// the name it resolves to is published by exactly one advertised world
+    /// pack, and that pack is the one the caller named.
+    #[test]
+    fn a_resolved_name_always_names_the_pack_the_caller_named() {
+        let shapes: Vec<Value> = vec![
+            // A world pack that publishes its name.
+            json!([{"id":"world.a","name":"a","packageType":"world"}]),
+            // A world pack that publishes no name.
+            json!([{"id":"world.b","packageType":"world"}]),
+            // Two world packs sharing a name.
+            json!([{"id":"world.c","name":"shared","packageType":"world"},{"id":"world.d","name":"shared","packageType":"world"}]),
+            // A world pack whose id is another pack's name.
+            json!([{"id":"world.e","name":"e","packageType":"world"},{"id":"world.f","name":"world.e","packageType":"world"}]),
+            // A package pack whose id is a world pack's name.
+            json!([{"id":"world.g","name":"g","packageType":"world"},{"id":"g","name":"g","packageType":"system"}]),
+            // A padded name.
+            json!([{"id":"world.h","name":" h ","packageType":"world"}]),
+            // A pack whose id equals its name.
+            json!([{"id":"i","name":"i","packageType":"world"}]),
+            // A package pack only.
+            json!([{"id":"sys.j","name":"j","packageType":"system"}]),
+        ];
+        for shape in &shapes {
+            let packs = shape.as_array().expect("a pack list");
+            let references: Vec<String> = packs
+                .iter()
+                .flat_map(|pack| {
+                    [
+                        pack.get("id").and_then(Value::as_str),
+                        pack.get("name").and_then(Value::as_str),
+                    ]
+                })
+                .flatten()
+                .map(str::to_owned)
+                .collect();
+            for reference in references {
+                let Ok(resolved) = resolve_pack_name(shape, &reference) else {
+                    continue;
+                };
+                // The resolved name is published by exactly one world pack.
+                let carriers: Vec<&Value> = packs
+                    .iter()
+                    .filter(|pack| {
+                        read_ops::is_world_pack(pack)
+                            && pack.get("name").and_then(Value::as_str) == Some(resolved.as_str())
+                    })
+                    .collect();
+                assert_eq!(
+                    carriers.len(),
+                    1,
+                    "{reference} resolved to {resolved}, which {} packs publish",
+                    carriers.len()
+                );
+                // And that pack is the one the caller named.
+                let named = packs
+                    .iter()
+                    .find(|pack| {
+                        pack.get("id").and_then(Value::as_str) == Some(reference.as_str())
+                            || (read_ops::is_world_pack(pack)
+                                && pack.get("name").and_then(Value::as_str)
+                                    == Some(reference.as_str()))
+                    })
+                    .expect("the reference named an advertised pack");
+                assert_eq!(
+                    carriers[0].get("id"),
+                    named.get("id"),
+                    "{reference} resolved to {resolved}, which names another pack"
+                );
+            }
+        }
     }
 
     #[test]
