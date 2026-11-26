@@ -101,17 +101,29 @@ impl ScopedToken {
 /// What the authentication layer decided about one request. The marker is
 /// attached to the request so the shared application layer can require
 /// authentication for writes without either transport adapter re-deciding
-/// it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// it, and so the verified *scope* travels with the request: a credential
+/// issued for one instance may only reach that instance.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Authentication {
-    /// The request presented a valid, in-scope token.
-    Authenticated,
+    /// The request presented a valid token, and it was issued for this
+    /// scope.
+    Authenticated(Scope),
     /// The request presented no token (the deployment has none configured).
     Unauthenticated,
 }
 
 impl Authentication {
     pub fn is_authenticated(&self) -> bool {
-        matches!(self, Authentication::Authenticated)
+        matches!(self, Authentication::Authenticated(_))
+    }
+
+    /// The verified scope of an authenticated request. It is `None` only
+    /// when the deployment has no token configured, which keeps the local
+    /// posture of unauthenticated reads unchanged.
+    pub fn scope(&self) -> Option<&Scope> {
+        match self {
+            Authentication::Authenticated(scope) => Some(scope),
+            Authentication::Unauthenticated => None,
+        }
     }
 }

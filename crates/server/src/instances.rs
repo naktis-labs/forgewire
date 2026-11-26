@@ -19,6 +19,7 @@
 //! bearer token is issued for, so it names exactly one instance and is
 //! resolved through the same configured set.
 
+use crate::auth::Scope;
 use foundry_connector::FoundryCredential;
 use rand::RngCore;
 use serde_json::{json, Value};
@@ -75,6 +76,22 @@ impl Instances {
             .get(index)
             .ok_or_else(|| anyhow::anyhow!("instance not found"))?;
         Ok(canonical_scope(index, credential))
+    }
+
+    /// Whether the instance at `index` is the one `scope` names. A
+    /// credential is issued for exactly one instance, so this is the check
+    /// that keeps a request from reaching another one.
+    pub fn matches_scope(&self, index: usize, scope: &Scope) -> anyhow::Result<bool> {
+        Ok(self.canonical_scope(index)? == scope.as_str())
+    }
+
+    /// The index of the instance `scope` names, when the scope names one.
+    pub fn index_for_scope(&self, scope: &Scope) -> Option<usize> {
+        self.credentials
+            .iter()
+            .enumerate()
+            .find(|(index, credential)| canonical_scope(*index, credential) == scope.as_str())
+            .map(|(index, _)| index)
     }
 
     /// Resolve a scope name to the instance it names. A scope names exactly

@@ -276,9 +276,24 @@ fn credential(id: &str, hostname: &str) -> FoundryCredential {
 /// configured token ignore it; deployments with one require it.
 const FIXTURE_CREDENTIAL: &str = "one.fixture-token";
 
+/// The secret of the fixture token.
+const FIXTURE_SECRET: &str = "fixture-token";
+
+/// The scope of the first configured instance.
+const FIRST_SCOPE: &str = "one";
+/// The scope of the second configured instance.
+const SECOND_SCOPE: &str = "two";
+
+/// The bearer credential of a scope: `<scope>.<secret>`. A credential is
+/// issued for exactly one instance, so a request presents the credential of
+/// the instance it means to reach.
+fn credential_for(scope: &str) -> String {
+    format!("{scope}.{FIXTURE_SECRET}")
+}
+
 /// The fixture token: issued for the scope of the first configured instance.
-fn fixture_token() -> auth::ScopedToken {
-    auth::ScopedToken::new(auth::Scope::new("one").unwrap(), "fixture-token".to_owned()).unwrap()
+fn token_for(scope: &str) -> auth::ScopedToken {
+    auth::ScopedToken::new(auth::Scope::new(scope).unwrap(), FIXTURE_SECRET.to_owned()).unwrap()
 }
 
 fn contract_app(allow_writes: bool) -> (Router, Arc<FakeConnector>) {
@@ -288,11 +303,26 @@ fn contract_app(allow_writes: bool) -> (Router, Arc<FakeConnector>) {
 /// An app that requires the fixture token. Writes need an authenticated
 /// request, so the mutating contracts run against this one.
 fn contract_app_with_token(allow_writes: bool) -> (Router, Arc<FakeConnector>) {
-    contract_app_with_token_and_sessions(
+    contract_app_with_token_for(allow_writes, FIRST_SCOPE)
+}
+
+/// An app whose token is issued for `scope`: a request must present that
+/// scope's credential, and it may only reach that instance.
+fn contract_app_with_token_for(allow_writes: bool, scope: &str) -> (Router, Arc<FakeConnector>) {
+    contract_app_with_token_and_sessions_for(
         allow_writes,
         instances::DEFAULT_SESSION_CAPACITY,
-        Some(fixture_token()),
+        scope,
     )
+}
+
+/// The same, with an injected session capacity.
+fn contract_app_with_token_and_sessions_for(
+    allow_writes: bool,
+    session_capacity: usize,
+    scope: &str,
+) -> (Router, Arc<FakeConnector>) {
+    contract_app_with_token_and_sessions(allow_writes, session_capacity, Some(token_for(scope)))
 }
 
 /// Tests that exercise session expiry inject a small capacity so a second
@@ -330,12 +360,23 @@ async fn rest_send(
     path: &str,
     body: Option<Value>,
 ) -> (StatusCode, Value) {
+    rest_send_with(router, method, path, body, FIXTURE_CREDENTIAL).await
+}
+
+/// A REST request presenting `credential` as its bearer token.
+async fn rest_send_with(
+    router: &Router,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+    credential: &str,
+) -> (StatusCode, Value) {
     let request = Request::builder()
         .method(method)
         .uri(path)
         .header("host", "localhost")
         .header("content-type", "application/json")
-        .header("authorization", format!("Bearer {FIXTURE_CREDENTIAL}"))
+        .header("authorization", format!("Bearer {credential}"))
         .body(Body::from(
             body.map(|body| body.to_string()).unwrap_or_default(),
         ))
@@ -353,8 +394,13 @@ async fn rest_get(router: &Router, path: &str) -> (StatusCode, Value) {
     rest_send(router, "GET", path, None).await
 }
 
+/// A GET request presenting `credential` as its bearer token.
+async fn rest_get_with(router: &Router, path: &str, credential: &str) -> (StatusCode, Value) {
+    rest_send_with(router, "GET", path, None, credential).await
+}
+
 async fn mcp_call(router: &Router, name: &str, arguments: Value) -> (StatusCode, Value) {
-    mcp_call_as(router, None, name, arguments).await
+    mcp_call_with(router, None, name, arguments, FIXTURE_CREDENTIAL).await
 }
 
 /// Call an MCP tool as a specific session (`Mcp-Session-Id` header) or as an
@@ -365,11 +411,22 @@ async fn mcp_call_as(
     name: &str,
     arguments: Value,
 ) -> (StatusCode, Value) {
+    mcp_call_with(router, session, name, arguments, FIXTURE_CREDENTIAL).await
+}
+
+/// An MCP tool call presenting `credential` as its bearer token.
+async fn mcp_call_with(
+    router: &Router,
+    session: Option<&str>,
+    name: &str,
+    arguments: Value,
+    credential: &str,
+) -> (StatusCode, Value) {
     let body = json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":arguments}});
     let mut request = Request::post("/mcp")
         .header("host", "localhost")
         .header("content-type", "application/json")
-        .header("authorization", format!("Bearer {FIXTURE_CREDENTIAL}"));
+        .header("authorization", format!("Bearer {credential}"));
     if let Some(id) = session {
         request = request.header("mcp-session-id", id);
     }
@@ -388,11 +445,16 @@ async fn mcp_call_as(
 
 /// Initialize an MCP client session and return the server-issued session id.
 async fn mcp_initialize(router: &Router) -> String {
+    mcp_initialize_with(router, FIXTURE_CREDENTIAL).await
+}
+
+/// Initialize an MCP client session presenting `credential`.
+async fn mcp_initialize_with(router: &Router, credential: &str) -> String {
     let body = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}});
     let request = Request::post("/mcp")
         .header("host", "localhost")
         .header("content-type", "application/json")
-        .header("authorization", format!("Bearer {FIXTURE_CREDENTIAL}"))
+        .header("authorization", format!("Bearer {credential}"))
         .body(Body::from(body.to_string()))
         .unwrap();
     let response = router.clone().oneshot(request).await.unwrap();
@@ -405,18 +467,19 @@ async fn mcp_initialize(router: &Router) -> String {
         .to_owned()
 }
 
-/// Send a raw MCP request (any method) with an optional session header.
+/// A raw MCP request presenting `credential` as its bearer token.
 /// Returns the status, the parsed body, and the server-issued session header
 /// when `initialize` answered.
-async fn mcp_send(
+async fn mcp_send_with(
     router: &Router,
     session: Option<&str>,
     body: Value,
+    credential: &str,
 ) -> (StatusCode, Value, Option<String>) {
     let mut request = Request::post("/mcp")
         .header("host", "localhost")
         .header("content-type", "application/json")
-        .header("authorization", format!("Bearer {FIXTURE_CREDENTIAL}"));
+        .header("authorization", format!("Bearer {credential}"));
     if let Some(id) = session {
         request = request.header("mcp-session-id", id);
     }
@@ -1053,12 +1116,21 @@ async fn rest_and_mcp_uploads_share_gating_overwrite_and_byte_parity() {
 /// named instance is used, and unknown references are rejected before any
 /// connector contact. Listing flags which entry a reference would target
 /// without ever disclosing secrets.
+///
+/// A credential is issued for exactly one instance, so each request presents
+/// the credential of the instance it means to reach: the stable default is
+/// exercised with the credential of the first configured entry, the explicit
+/// targets with the credential of the instance they name, and a target
+/// outside the credential's scope is refused before any contact.
 #[tokio::test]
 async fn rest_targets_the_stable_default_or_an_explicit_instance() {
-    let (router, fake) = contract_app_with_token(true);
+    // The deployment's token is issued for the first configured instance, so
+    // the stable default — the first configured entry — is in scope.
+    let (router, fake) = contract_app_with_token_for(true, FIRST_SCOPE);
+    let first = credential_for(FIRST_SCOPE);
 
     // Default: the first configured entry.
-    let (status, _) = rest_get(&router, "/api/world").await;
+    let (status, _) = rest_get_with(&router, "/api/world", &first).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         fake.tail(1)[0],
@@ -1066,51 +1138,91 @@ async fn rest_targets_the_stable_default_or_an_explicit_instance() {
         "the default target is the first configured entry"
     );
 
-    // Explicit by configured id...
-    let (status, _) = rest_get(&router, "/api/world?instance=two").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(fake.tail(1)[0], "world:two.example");
-    // ...or by zero-based item_order.
-    let (status, _) = rest_get(&router, "/api/world?instance=1").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(fake.tail(1)[0], "world:two.example");
-
-    // Writes target explicitly too.
-    let (status, _) = rest_send(
-        &router,
-        "POST",
-        "/api/write/create_document?instance=two",
-        Some(json!({"kind":"Actor","data":[{"name":"New"}]})),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert!(fake.tail(1)[0].contains("create:Actor:two.example:"));
+    // An explicit target outside the credential's scope is refused before
+    // any connector contact.
+    let (status, error) = rest_get_with(&router, "/api/world?instance=two", &first).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error["error"], OUT_OF_SCOPE);
 
     // Unknown references are caller mistakes rejected before any contact.
     for reference in ["missing", "9"] {
-        let (status, rest) = rest_get(&router, &format!("/api/world?instance={reference}")).await;
+        let (status, rest) =
+            rest_get_with(&router, &format!("/api/world?instance={reference}"), &first).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{reference}");
         assert_eq!(rest["error"], "instance not found", "{reference}");
     }
     assert_eq!(
         fake.recorded().len(),
-        4,
+        1,
         "rejected targets must not reach the connector"
     );
 
     // A leading '+' is malformed addressing, not a signed order: it is
     // refused, never normalized into item_order 1.
-    let (status, rest) = rest_get(&router, "/api/world?instance=%2B1").await;
+    let (status, rest) = rest_get_with(&router, "/api/world?instance=%2B1", &first).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(rest["error"], "invalid instance reference");
     assert_eq!(
         fake.recorded().len(),
-        4,
+        1,
         "a '+'-prefixed reference must not reach the connector"
     );
 
+    // Listing flags which entry the request would target: here the stable
+    // default, which is the instance this credential is issued for.
+    let (status, listing) = rest_get_with(&router, "/api/instances", &first).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        listing[0]["currently_active"], true,
+        "the stable default is the first configured entry"
+    );
+    assert!(!listing.to_string().contains("login-one"));
+
+    // A deployment whose token is issued for the second instance reaches
+    // that instance explicitly, by configured id and by zero-based
+    // item_order, and writes target it too.
+    let (router, fake) = contract_app_with_token_for(true, SECOND_SCOPE);
+    let second = credential_for(SECOND_SCOPE);
+
+    // Explicit by configured id...
+    let (status, _) = rest_get_with(&router, "/api/world?instance=two", &second).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(fake.tail(1)[0], "world:two.example");
+    // ...or by zero-based item_order.
+    let (status, _) = rest_get_with(&router, "/api/world?instance=1", &second).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(fake.tail(1)[0], "world:two.example");
+
+    // Writes target explicitly too.
+    let (status, _) = rest_send_with(
+        &router,
+        "POST",
+        "/api/write/create_document?instance=two",
+        Some(json!({"kind":"Actor","data":[{"name":"New"}]})),
+        &second,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(fake.tail(1)[0].contains("create:Actor:two.example:"));
+
+    // The stable default is the first configured entry, which is outside
+    // this credential's scope: it is refused, not silently reached.
+    let (status, error) = rest_get_with(&router, "/api/world", &second).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error["error"], OUT_OF_SCOPE);
+    assert_eq!(
+        fake.recorded().len(),
+        3,
+        "a refused target must not reach the connector"
+    );
+
+    // The other instance's credential is not this deployment's credential:
+    // it is refused as an authentication failure, before any scope talk.
+    let (status, _) = rest_get_with(&router, "/api/world?instance=two", &first).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
     // Listing flags which entry the requested reference would target.
-    let (status, listing) = rest_get(&router, "/api/instances?instance=two").await;
+    let (status, listing) = rest_get_with(&router, "/api/instances?instance=two", &second).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(listing[1]["currently_active"], true);
     assert_eq!(listing[0]["currently_active"], false);
@@ -1119,13 +1231,6 @@ async fn rest_targets_the_stable_default_or_an_explicit_instance() {
         !listed.contains("secret-two") && !listed.contains("login-two"),
         "instance listing must not disclose passwords or usernames"
     );
-    let (status, listing) = rest_get(&router, "/api/instances").await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        listing[0]["currently_active"], true,
-        "the stable default is the first configured entry"
-    );
-    assert!(!listing.to_string().contains("login-one"));
 }
 
 /// MCP selection is scoped to the client's own session: one session's choice
@@ -1230,30 +1335,41 @@ async fn mcp_selection_is_session_scoped_and_never_redirects_rest() {
 /// never leaks into the sessions that follow. Writes are no exception: an
 /// expired session's write fails with the initialize-again error instead of
 /// silently running against the stable default instance.
+///
+/// The fixture token is issued for the second instance, so the selection the
+/// session makes is one its credential is authorized for.
 #[tokio::test]
 async fn expired_sessions_are_refused_until_the_client_initializes_again() {
-    let (router, fake) = contract_app_with_token_and_sessions(true, 1, Some(fixture_token()));
+    let (router, fake) = contract_app_with_token_and_sessions_for(true, 1, SECOND_SCOPE);
+    let second = credential_for(SECOND_SCOPE);
 
-    let session_a = mcp_initialize(&router).await;
-    let (status, selected) = mcp_call_as(
+    let session_a = mcp_initialize_with(&router, &second).await;
+    let (status, selected) = mcp_call_with(
         &router,
         Some(&session_a),
         "choose_foundry_instance",
         json!({"item_order":1}),
+        &second,
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(selected["result"]["structuredContent"]["selected"], true);
 
     // The next initialize fills the table and expires session A.
-    let session_b = mcp_initialize(&router).await;
+    let session_b = mcp_initialize_with(&router, &second).await;
     assert_ne!(session_a, session_b);
 
     // Every tool call — including a selection attempt — is refused with 404
     // and the initialize-again guidance instead of resurrecting the session.
     for name in ["get_world", "choose_foundry_instance", "show_credentials"] {
-        let (status, body) =
-            mcp_call_as(&router, Some(&session_a), name, json!({"item_order":1})).await;
+        let (status, body) = mcp_call_with(
+            &router,
+            Some(&session_a),
+            name,
+            json!({"item_order":1}),
+            &second,
+        )
+        .await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{name}");
         assert_eq!(
             body["error"], "unknown or expired MCP session; initialize again",
@@ -1264,11 +1380,12 @@ async fn expired_sessions_are_refused_until_the_client_initializes_again() {
     // A write is refused the same way even though writes are enabled: the
     // expired session must not silently run the write against the stable
     // default instance (or anywhere else).
-    let (status, body) = mcp_call_as(
+    let (status, body) = mcp_call_with(
         &router,
         Some(&session_a),
         "create_document",
         json!({"kind":"Actor","data":[{"name":"Written while expired"}]}),
+        &second,
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -1283,50 +1400,57 @@ async fn expired_sessions_are_refused_until_the_client_initializes_again() {
 
     // Re-initializing while still carrying the expired header must not revive
     // it: a brand new id is issued and the old one stays dead.
-    let (status, body, issued) = mcp_send(
+    let (status, body, issued) = mcp_send_with(
         &router,
         Some(&session_a),
         json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}),
+        &second,
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["result"]["protocolVersion"], "2025-06-18");
     let session_c = issued.expect("initialize must issue a fresh session id");
     assert_ne!(session_c, session_a, "the expired id must not be reused");
-    let (status, body) = mcp_call_as(&router, Some(&session_a), "get_world", json!({})).await;
+    let (status, body) =
+        mcp_call_with(&router, Some(&session_a), "get_world", json!({}), &second).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "the old id stays expired");
     assert_eq!(
         body["error"],
         "unknown or expired MCP session; initialize again"
     );
 
-    // The fresh session works and starts on the stable default: the expired
-    // session's selection did not leak into it.
-    let (_, mcp) = mcp_call_as(&router, Some(&session_c), "get_world", json!({})).await;
-    assert_eq!(mcp["result"]["isError"], false);
+    // The fresh session inherits nothing: with no selection of its own it
+    // targets the documented stable default, which is outside its
+    // credential's scope and so refused. Had the expired session's selection
+    // of the second instance leaked into it, this call would have succeeded
+    // against that instance instead.
+    let (_, mcp) = mcp_call_with(&router, Some(&session_c), "get_world", json!({}), &second).await;
+    assert_eq!(mcp["result"]["isError"], true);
     assert_eq!(
-        fake.tail(1)[0],
-        "world:one.example",
+        mcp_error_text(&mcp),
+        OUT_OF_SCOPE,
         "an expired session's selection must not leak into later sessions"
     );
 
     // Positive control for the refusals above: a live session's write targets
     // its own selection, so the 404s are specifically about expiry, and a
     // session's writes follow its selection rather than the stable default.
-    let (status, selected) = mcp_call_as(
+    let (status, selected) = mcp_call_with(
         &router,
         Some(&session_c),
         "choose_foundry_instance",
         json!({"item_order":1}),
+        &second,
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(selected["result"]["structuredContent"]["selected"], true);
-    let (status, _) = mcp_call_as(
+    let (status, _) = mcp_call_with(
         &router,
         Some(&session_c),
         "create_document",
         json!({"kind":"Actor","data":[{"name":"Written while live"}]}),
+        &second,
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -1404,13 +1528,19 @@ async fn duplicate_and_non_utf8_session_headers_are_refused() {
 }
 
 /// Every Foundry-contacting REST route resolves `?instance=` the same way: a
-/// valid reference targets that instance for that one request, and an invalid
-/// reference is a 400 before the connector is contacted. The non-contacting
-/// listing route honors the parameter too. An MCP session's selection never
-/// moves REST: REST keeps its stable default and its own explicit targeting.
+/// valid reference targets that instance for that one request, a reference
+/// outside the request's credential scope is a 403, and an invalid reference
+/// is a 400 — all before the connector is contacted. The non-contacting
+/// listing route honors the parameter the same way. An MCP session's
+/// selection never moves REST: REST keeps its stable default and its own
+/// explicit targeting.
 #[tokio::test]
 async fn every_foundry_rest_route_honors_the_instance_parameter() {
-    let (router, fake) = contract_app_with_token(true);
+    // The token is issued for the second instance, so every route is
+    // exercised against the instance its reference names, with the
+    // credential that instance's scope calls for.
+    let (router, fake) = contract_app_with_token_for(true, SECOND_SCOPE);
+    let second = credential_for(SECOND_SCOPE);
 
     let routes: [(&str, &str, Option<Value>); 10] = [
         ("GET", "/api/world", None),
@@ -1452,8 +1582,14 @@ async fn every_foundry_rest_route_honors_the_instance_parameter() {
 
     for (method, path, body) in routes {
         let before = fake.recorded().len();
-        let (status, _) =
-            rest_send(&router, method, &with_instance(path, "two"), body.clone()).await;
+        let (status, _) = rest_send_with(
+            &router,
+            method,
+            &with_instance(path, "two"),
+            body.clone(),
+            &second,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "{method} {path}");
         let calls = fake.recorded();
         assert_eq!(calls.len(), before + 1, "{method} {path}");
@@ -1463,13 +1599,32 @@ async fn every_foundry_rest_route_honors_the_instance_parameter() {
             calls.last().unwrap()
         );
 
+        // A reference outside the credential's scope is refused on every
+        // route alike, before any connector contact.
+        let (status, error) = rest_send_with(
+            &router,
+            method,
+            &with_instance(path, "one"),
+            body.clone(),
+            &second,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}");
+        assert_eq!(error["error"], OUT_OF_SCOPE, "{method} {path}");
+        assert_eq!(
+            fake.recorded().len(),
+            before + 1,
+            "{method} {path} must not reach the connector outside its scope"
+        );
+
         // An invalid reference is a caller mistake rejected before any
         // connector contact, on every route alike.
-        let (status, error) = rest_send(
+        let (status, error) = rest_send_with(
             &router,
             method,
             &with_instance(path, "missing"),
             body.clone(),
+            &second,
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {path}");
@@ -1483,18 +1638,26 @@ async fn every_foundry_rest_route_honors_the_instance_parameter() {
 
     // The listing route never contacts Foundry but honors the parameter and
     // rejects invalid references the same way, without disclosing secrets.
-    let (status, listing) = rest_get(&router, "/api/instances?instance=two").await;
+    let (status, listing) = rest_get_with(&router, "/api/instances?instance=two", &second).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(listing[1]["currently_active"], true);
     let listed = listing.to_string();
     assert!(!listed.contains("secret-two") && !listed.contains("login-two"));
-    let (status, error) = rest_get(&router, "/api/instances?instance=missing").await;
+    let (status, error) = rest_get_with(&router, "/api/instances?instance=missing", &second).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(error["error"], "instance not found");
+    // A reference outside the credential's scope is refused like on any
+    // other route.
+    let (status, error) = rest_get_with(&router, "/api/instances?instance=one", &second).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(error["error"], OUT_OF_SCOPE);
 
     // An MCP session's selection never affects REST: the session's own calls
     // follow its selection while REST keeps the stable default, and REST's
-    // explicit references stay independent of anything MCP chose.
+    // explicit references stay independent of anything MCP chose. Both
+    // targets must be reachable for the comparison, so it runs in a
+    // deployment without a token, where reads are open for every instance.
+    let (router, fake) = contract_app(false);
     let session = mcp_initialize(&router).await;
     let (status, selected) = mcp_call_as(
         &router,

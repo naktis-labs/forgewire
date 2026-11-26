@@ -37,11 +37,17 @@ struct App {
     allow_writes: bool,
 }
 
+/// The refusal for a request whose credential is not issued for the instance
+/// it targets. The credential itself was valid, so this is an authorization
+/// failure rather than an authentication one.
+const OUT_OF_SCOPE: &str =
+    "the presented credential is not authorized for the requested Foundry instance";
+
 impl App {
     /// The write gate for one request: the operator's opt-in plus this
     /// request's own authentication. Both transports build it the same way,
     /// so a write is never reachable through one of them alone.
-    fn write_policy(&self, authentication: auth::Authentication) -> operations::WritePolicy {
+    fn write_policy(&self, authentication: &auth::Authentication) -> operations::WritePolicy {
         if authentication.is_authenticated() {
             operations::WritePolicy::authenticated(self.allow_writes)
         } else {
@@ -52,19 +58,57 @@ impl App {
 
 /// Resolve a REST request's Foundry target: `?instance=<id|item_order>` when
 /// given, else the documented stable default — the first configured entry.
+///
 /// The result is an owned credential snapshot taken once per request, so
 /// neither MCP selections nor other REST requests can retarget work already
 /// in flight; there is no process-global selection to inherit or mutate.
+///
+/// When the deployment has a token configured, the request's credential is
+/// issued for exactly one instance: a target outside that scope is refused
+/// here, before any Foundry contact. With no token configured there is no
+/// scope to enforce and the local posture is unchanged.
 fn rest_target(
     instances: &instances::Instances,
     query: &HashMap<String, String>,
+    authentication: &auth::Authentication,
 ) -> Result<FoundryCredential, (StatusCode, Json<Value>)> {
     match query.get("instance") {
-        Some(reference) => instances
-            .resolve_reference(reference)
-            .and_then(|index| instances.credential(index))
-            .map_err(|e| rest_error(StatusCode::BAD_REQUEST, e)),
-        None => Ok(instances.default_snapshot()),
+        Some(reference) => {
+            let index = instances
+                .resolve_reference(reference)
+                .map_err(|e| rest_error(StatusCode::BAD_REQUEST, e))?;
+            let index = authorized_instance(instances, index, authentication)
+                .map_err(|e| rest_error(StatusCode::FORBIDDEN, e))?;
+            instances
+                .credential(index)
+                .map_err(|e| rest_error(StatusCode::BAD_REQUEST, e))
+        }
+        None => {
+            // The stable default is the first configured entry, and it is
+            // checked against the credential's scope like any other target.
+            authorized_instance(instances, 0, authentication)
+                .map_err(|e| rest_error(StatusCode::FORBIDDEN, e))?;
+            Ok(instances.default_snapshot())
+        }
+    }
+}
+
+/// Check a resolved instance against the request's credential.
+///
+/// With no token configured there is no scope to check, and the local
+/// posture is unchanged. With a token configured the credential is issued
+/// for exactly one instance, so any other instance is refused before the
+/// connector is reached.
+fn authorized_instance(
+    instances: &instances::Instances,
+    index: usize,
+    authentication: &auth::Authentication,
+) -> anyhow::Result<usize> {
+    match authentication.scope() {
+        Some(scope) if !instances.matches_scope(index, scope)? => {
+            anyhow::bail!("{OUT_OF_SCOPE}")
+        }
+        _ => Ok(index),
     }
 }
 
@@ -73,9 +117,10 @@ async fn health() -> Json<Value> {
 }
 async fn world(
     State(app): State<Arc<App>>,
+    Extension(authentication): Extension<auth::Authentication>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let credential = rest_target(&app.instances, &query)?;
+    let credential = rest_target(&app.instances, &query, &authentication)?;
     operations::world(&*app.client, &credential)
         .await
         .map(Json)
@@ -83,10 +128,11 @@ async fn world(
 }
 async fn collection(
     State(app): State<Arc<App>>,
+    Extension(authentication): Extension<auth::Authentication>,
     Path(name): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let credential = rest_target(&app.instances, &query)?;
+    let credential = rest_target(&app.instances, &query, &authentication)?;
     operations::collection(&*app.client, &credential, &name)
         .await
         .map(Json)
@@ -112,6 +158,7 @@ fn operation_status(error: operations::OperationError) -> (StatusCode, Json<Valu
 
 async fn rest_documents(
     State(app): State<Arc<App>>,
+    Extension(authentication): Extension<auth::Authentication>,
     Path(collection): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -121,7 +168,7 @@ async fn rest_documents(
         .map_err(|e| rest_error(StatusCode::BAD_REQUEST, e))?;
     let req =
         operations::parse_read(&name, &args).map_err(|e| rest_error(StatusCode::BAD_REQUEST, e))?;
-    let credential = rest_target(&app.instances, &query)?;
+    let credential = rest_target(&app.instances, &query, &authentication)?;
     operations::execute_read(&*app.client, &credential, &req)
         .await
         .map(Json)
@@ -130,13 +177,14 @@ async fn rest_documents(
 
 async fn rest_compendiums(
     State(app): State<Arc<App>>,
+    Extension(authentication): Extension<auth::Authentication>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let args = query
         .get("type")
         .map(|value| json!({"type":value}))
         .unwrap_or_else(|| json!({}));
-    let credential = rest_target(&app.instances, &query)?;
+    let credential = rest_target(&app.instances, &query, &authentication)?;
     operations::read(&*app.client, &credential, "get_compendiums", &args)
         .await
         .map(Json)
@@ -145,6 +193,7 @@ async fn rest_compendiums(
 
 async fn rest_compendium_documents(
     State(app): State<Arc<App>>,
+    Extension(authentication): Extension<auth::Authentication>,
     Path((pack, kind)): Path<(String, String)>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
@@ -154,7 +203,7 @@ async fn rest_compendium_documents(
         .map_err(|e| rest_error(StatusCode::BAD_REQUEST, e))?;
     let req =
         operations::parse_read(&name, &args).map_err(|e| rest_error(StatusCode::BAD_REQUEST, e))?;
-    let credential = rest_target(&app.instances, &query)?;
+    let credential = rest_target(&app.instances, &query, &authentication)?;
     operations::execute_read(&*app.client, &credential, &req)
         .await
         .map(Json)
@@ -167,11 +216,11 @@ async fn rest_create_compendium(
     Query(query): Query<HashMap<String, String>>,
     Json(args): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let credential = rest_target(&app.instances, &query)?;
+    let credential = rest_target(&app.instances, &query, &authentication)?;
     operations::compendium(
         &*app.client,
         &credential,
-        app.write_policy(authentication),
+        app.write_policy(&authentication),
         "create_compendium",
         &args,
     )
@@ -186,11 +235,11 @@ async fn rest_delete_compendium(
     Path(name): Path<String>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let credential = rest_target(&app.instances, &query)?;
+    let credential = rest_target(&app.instances, &query, &authentication)?;
     operations::compendium(
         &*app.client,
         &credential,
-        app.write_policy(authentication),
+        app.write_policy(&authentication),
         "delete_compendium",
         &json!({"name":name}),
     )
@@ -201,22 +250,43 @@ async fn rest_delete_compendium(
 
 async fn rest_instances(
     State(app): State<Arc<App>>,
+    Extension(authentication): Extension<auth::Authentication>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     // Listing flags which entry the requested reference (or the stable
     // default) would target; it never exposes secrets or connection state.
+    // The flag never names an instance the request's credential is not
+    // issued for.
     let selected = match query.get("instance") {
-        Some(reference) => app
-            .instances
-            .resolve_reference(reference)
+        Some(reference) => {
+            let index = app
+                .instances
+                .resolve_reference(reference)
+                .map_err(|e| rest_error(StatusCode::BAD_REQUEST, e))?;
+            authorized_instance(&app.instances, index, &authentication)
+                .map_err(|e| rest_error(StatusCode::FORBIDDEN, e))?
+        }
+        None => active_instance(&app.instances, &authentication)
             .map_err(|e| rest_error(StatusCode::BAD_REQUEST, e))?,
-        None => 0,
     };
     Ok(Json(app.instances.show(selected)))
 }
 
+/// The instance a request's credential is for: the instance it was issued
+/// for when a token is configured, else the documented stable default.
+fn active_instance(
+    instances: &instances::Instances,
+    authentication: &auth::Authentication,
+) -> anyhow::Result<usize> {
+    Ok(match authentication.scope() {
+        Some(scope) => instances.index_for_scope(scope).unwrap_or(0),
+        None => 0,
+    })
+}
+
 async fn rest_browse_files(
     State(app): State<Arc<App>>,
+    Extension(authentication): Extension<auth::Authentication>,
     Query(query): Query<HashMap<String, String>>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let mut args = json!({});
@@ -231,7 +301,7 @@ async fn rest_browse_files(
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>());
     }
-    let credential = rest_target(&app.instances, &query)?;
+    let credential = rest_target(&app.instances, &query, &authentication)?;
     operations::browse_files(&*app.client, &credential, &args)
         .await
         .map(Json)
@@ -244,11 +314,11 @@ async fn rest_upload_file(
     Query(query): Query<HashMap<String, String>>,
     Json(args): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let credential = rest_target(&app.instances, &query)?;
+    let credential = rest_target(&app.instances, &query, &authentication)?;
     operations::upload_file(
         &*app.client,
         &credential,
-        app.write_policy(authentication),
+        app.write_policy(&authentication),
         &args,
     )
     .await
@@ -269,11 +339,11 @@ async fn rest_write(
     ) {
         return Err(rest_error(StatusCode::NOT_FOUND, "unknown operation"));
     }
-    let credential = rest_target(&app.instances, &query)?;
+    let credential = rest_target(&app.instances, &query, &authentication)?;
     operations::write_document(
         &*app.client,
         &credential,
-        app.write_policy(authentication),
+        app.write_policy(&authentication),
         &operation,
         &args,
     )
@@ -291,9 +361,9 @@ async fn rest_write(
 /// With a token configured, the request must present exactly one
 /// `Authorization: Bearer <scope>.<secret>` header whose scope and secret
 /// are the configured ones. A token issued for another instance is refused
-/// even when its secret matches. The decision is attached to the request so
-/// the shared application layer can require authentication for writes
-/// without either transport re-deriving it.
+/// even when its secret matches. The verified scope travels with the
+/// request, so the routes and tools that select a Foundry instance can
+/// refuse a target the credential was not issued for.
 async fn authenticate(
     State(token): State<Option<auth::ScopedToken>>,
     mut request: Request,
@@ -326,7 +396,7 @@ async fn authenticate(
     }
     request
         .extensions_mut()
-        .insert(auth::Authentication::Authenticated);
+        .insert(auth::Authentication::Authenticated(token.scope().clone()));
     next.run(request).await
 }
 
@@ -520,7 +590,7 @@ async fn mcp(
             let args = params.get("arguments").unwrap_or(&Value::Null);
             // The write gate for this request: the operator's opt-in plus
             // the authentication the middleware already decided.
-            let policy = app.write_policy(authentication);
+            let policy = app.write_policy(&authentication);
             // The target is the scope resolved atomically with the session
             // check above: the session's own selection, or the stable default
             // when it has not chosen (or the caller is anonymous). The
@@ -530,9 +600,29 @@ async fn mcp(
                 instances::SessionScope::Default | instances::SessionScope::Expired => None,
             };
             let result = match name {
-                "show_credentials" => Ok(app.instances.show(selected.unwrap_or(0))),
+                "show_credentials" => {
+                    // The flagged entry is the session's own selection, else
+                    // the instance the credential was issued for, else the
+                    // stable default.
+                    let index = selected
+                        .or_else(|| {
+                            authentication
+                                .scope()
+                                .and_then(|scope| app.instances.index_for_scope(scope))
+                        })
+                        .unwrap_or(0);
+                    Ok(app.instances.show(index))
+                }
                 "choose_foundry_instance" => match &session {
                     Some(id) => app.instances.resolve_selection(args).and_then(|index| {
+                        // A credential is issued for exactly one instance: a
+                        // selection outside its scope is refused before it is
+                        // recorded, so the session keeps its previous target.
+                        let index = authorized_instance(
+                            &app.instances,
+                            index,
+                            &authentication,
+                        )?;
                         // `select` re-checks liveness under the lock that
                         // records the choice: a session evicted after this
                         // request's own session check (a concurrent
@@ -551,10 +641,16 @@ async fn mcp(
                     )),
                 },
                 _ => {
-                    let credential = match selected {
-                        Some(index) => app.instances.credential(index),
-                        None => Ok(app.instances.default_snapshot()),
-                    };
+                    // The target is checked against the credential's scope
+                    // here as well as at selection time: a target outside the
+                    // scope never reaches the connector.
+                    let index = selected.unwrap_or(0);
+                    let credential = authorized_instance(
+                        &app.instances,
+                        index,
+                        &authentication,
+                    )
+                    .and_then(|index| app.instances.credential(index));
                     match credential {
                         Ok(credential) => {
                             dispatch_tool(&app, &credential, policy, name, args).await

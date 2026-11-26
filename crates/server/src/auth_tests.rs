@@ -241,9 +241,23 @@ async fn rest(
 
 /// An MCP request carrying `credential` (when given) as its bearer token.
 async fn mcp(router: &Router, body: Value, credential: Option<&str>) -> (StatusCode, Value) {
+    mcp_as(router, None, body, credential).await
+}
+
+/// An MCP request carrying a client session id and, when given, a bearer
+/// token.
+async fn mcp_as(
+    router: &Router,
+    session: Option<&str>,
+    body: Value,
+    credential: Option<&str>,
+) -> (StatusCode, Value) {
     let mut request = Request::post("/mcp")
         .header("host", "localhost")
         .header("content-type", "application/json");
+    if let Some(id) = session {
+        request = request.header("mcp-session-id", id);
+    }
     if let Some(credential) = credential {
         request = request.header("authorization", format!("Bearer {credential}"));
     }
@@ -258,6 +272,26 @@ async fn mcp(router: &Router, body: Value, credential: Option<&str>) -> (StatusC
         status,
         serde_json::from_slice(&bytes).unwrap_or(Value::Null),
     )
+}
+
+/// Initialize an MCP client session and return the server-issued session id.
+async fn mcp_initialize_as(router: &Router, credential: &str) -> String {
+    let request = Request::post("/mcp")
+        .header("host", "localhost")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {credential}"))
+        .body(Body::from(
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize"}).to_string(),
+        ))
+        .unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("initialize must issue a session id")
+        .to_owned()
 }
 
 /// With a token configured, a request without a valid credential is refused:
@@ -514,6 +548,242 @@ async fn writes_require_authentication_and_the_opt_in() {
     assert!(
         connector.recorded().is_empty(),
         "a refused write must not reach Foundry"
+    );
+}
+
+/// A credential issued for one instance cannot read another one. The
+/// request is refused before the connector is reached, and the instance the
+/// credential *is* issued for stays reachable.
+#[tokio::test]
+async fn a_credential_cannot_read_another_instance() {
+    let (router, connector) = app(Some(token_for(SCOPE)), false);
+    let credential = format!("{SCOPE}.{SECRET}");
+
+    for path in [
+        "/api/world?instance=two",
+        "/api/collections/actors?instance=two",
+        "/api/documents/actors?instance=two",
+        "/api/compendiums?instance=two",
+        "/api/compendiums/pack-core/documents/actor?instance=two",
+        "/api/files?instance=two",
+        "/api/instances?instance=two",
+    ] {
+        let (status, body) = rest(&router, "GET", path, None, Some(&credential)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+        assert_eq!(body["error"], OUT_OF_SCOPE, "{path}");
+    }
+    assert!(
+        connector.recorded().is_empty(),
+        "a cross-instance read must not reach Foundry"
+    );
+
+    // A credential issued for the second instance may not read the stable
+    // default either: the default is the first configured instance.
+    let (router, connector) = app(Some(token_for(OTHER_SCOPE)), false);
+    let credential = format!("{OTHER_SCOPE}.{SECRET}");
+    let (status, body) = rest(&router, "GET", "/api/world", None, Some(&credential)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"], OUT_OF_SCOPE);
+    assert!(connector.recorded().is_empty());
+
+    // The instance the credential is issued for is still reachable.
+    let (status, world) = rest(
+        &router,
+        "GET",
+        "/api/world?instance=two",
+        None,
+        Some(&credential),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(world["title"], "Test World");
+    assert_eq!(connector.recorded(), vec!["world".to_owned()]);
+}
+
+/// A credential issued for one instance cannot mutate another one, not even
+/// with the write opt-in enabled.
+#[tokio::test]
+async fn a_credential_cannot_mutate_another_instance() {
+    let (router, connector) = app(Some(token_for(SCOPE)), true);
+    let credential = format!("{SCOPE}.{SECRET}");
+
+    let (status, body) = rest(
+        &router,
+        "POST",
+        "/api/write/create_document?instance=two",
+        Some(json!({"kind":"Actor","data":[{"name":"New"}]})),
+        Some(&credential),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"], OUT_OF_SCOPE);
+
+    let (status, body) = rest(
+        &router,
+        "POST",
+        "/api/files?instance=two",
+        Some(json!({"target":"data","filename":"note.txt","data_base64":"YQ==","overwrite":true})),
+        Some(&credential),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"], OUT_OF_SCOPE);
+
+    let (status, body) = rest(
+        &router,
+        "POST",
+        "/api/compendiums?instance=two",
+        Some(json!({"label":"Pack","type":"Actor"})),
+        Some(&credential),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"], OUT_OF_SCOPE);
+
+    assert!(
+        connector.recorded().is_empty(),
+        "a cross-instance mutation must not reach Foundry"
+    );
+}
+
+/// An MCP client may not select an instance its credential was not issued
+/// for, and the refused selection is not recorded.
+#[tokio::test]
+async fn mcp_instance_selection_for_another_instance_is_refused() {
+    let (router, connector) = app(Some(token_for(SCOPE)), false);
+    let credential = format!("{SCOPE}.{SECRET}");
+    let session = mcp_initialize_as(&router, &credential).await;
+
+    let (status, response) = mcp_as(
+        &router,
+        Some(&session),
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"choose_foundry_instance","arguments":{"id":"two"}}}),
+        Some(&credential),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["result"]["isError"], true);
+    assert_eq!(response["result"]["content"][0]["text"], OUT_OF_SCOPE);
+
+    // The refused selection was not recorded: the session still targets the
+    // instance its credential is issued for.
+    let (status, response) = mcp_as(
+        &router,
+        Some(&session),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_world","arguments":{}}}),
+        Some(&credential),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["result"]["isError"], false);
+    assert_eq!(connector.recorded(), vec!["world".to_owned()]);
+
+    // The instance the credential is issued for may be selected.
+    let (status, response) = mcp_as(
+        &router,
+        Some(&session),
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"choose_foundry_instance","arguments":{"id":"one"}}}),
+        Some(&credential),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["result"]["isError"], false);
+    assert_eq!(
+        response["result"]["content"][0]["text"],
+        "{\"item_order\":0,\"selected\":true}"
+    );
+}
+
+/// A credential in its own scope still reads and mutates that instance.
+#[tokio::test]
+async fn a_credential_in_its_scope_still_reads_and_mutates() {
+    let (router, connector) = app(Some(token_for(SCOPE)), true);
+    let credential = format!("{SCOPE}.{SECRET}");
+
+    // The stable default is the instance the credential is issued for.
+    let (status, world) = rest(&router, "GET", "/api/world", None, Some(&credential)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(world["title"], "Test World");
+
+    // The same instance named explicitly.
+    let (status, world) = rest(
+        &router,
+        "GET",
+        "/api/world?instance=one",
+        None,
+        Some(&credential),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(world["title"], "Test World");
+
+    // The mutation reaches the same instance.
+    let (status, _) = rest(
+        &router,
+        "POST",
+        "/api/write/create_document?instance=one",
+        Some(json!({"kind":"Actor","data":[{"name":"New"}]})),
+        Some(&credential),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        connector.recorded(),
+        vec![
+            "world".to_owned(),
+            "world".to_owned(),
+            "create_document:Actor".to_owned()
+        ]
+    );
+}
+
+/// One request cannot use an in-scope credential to reach a second instance:
+/// the out-of-scope instance never wins, on either transport.
+#[tokio::test]
+async fn a_scoped_credential_cannot_be_reused_to_target_a_second_instance() {
+    let (router, connector) = app(Some(token_for(SCOPE)), false);
+    let credential = format!("{SCOPE}.{SECRET}");
+
+    // A request naming two instances resolves to one of them, and the scope
+    // check refuses the out-of-scope one.
+    let (status, body) = rest(
+        &router,
+        "GET",
+        "/api/world?instance=one&instance=two",
+        None,
+        Some(&credential),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"], OUT_OF_SCOPE);
+
+    // An MCP session that selected the in-scope instance still cannot read
+    // another one.
+    let session = mcp_initialize_as(&router, &credential).await;
+    let (status, response) = mcp_as(
+        &router,
+        Some(&session),
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"choose_foundry_instance","arguments":{"id":"one"}}}),
+        Some(&credential),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["result"]["isError"], false);
+
+    let (status, response) = mcp_as(
+        &router,
+        Some(&session),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"choose_foundry_instance","arguments":{"id":"two"}}}),
+        Some(&credential),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(response["result"]["isError"], true);
+    assert_eq!(response["result"]["content"][0]["text"], OUT_OF_SCOPE);
+
+    assert!(
+        connector.recorded().is_empty(),
+        "a second instance must not be reached through an in-scope credential"
     );
 }
 
