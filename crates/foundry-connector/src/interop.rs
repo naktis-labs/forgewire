@@ -83,12 +83,24 @@ impl WorldFixture {
                 "description": "Disposable interoperability world",
                 "authors": [{"name": "Interop Harness"}],
             }),
-            packs: vec![json!({
-                "id": "world.items",
-                "label": "Items",
-                "type": "Item",
-                "packageName": "world"
-            })],
+            packs: vec![
+                json!({
+                    "id": "world.items",
+                    "name": "items",
+                    "label": "Items",
+                    "type": "Item",
+                    "packageName": "world",
+                    "packageType": "world"
+                }),
+                json!({
+                    "id": "dnd5e.monsters",
+                    "name": "monsters",
+                    "label": "Monsters",
+                    "type": "Actor",
+                    "packageName": "dnd5e",
+                    "packageType": "system"
+                }),
+            ],
             documents: vec![
                 json!({
                     "_id": "journal-1",
@@ -798,15 +810,54 @@ async fn socket_session(mut socket: WebSocket, state: Arc<FakeState>, socket_id:
                 .unwrap();
             let payload: Value = serde_json::from_str(payload).unwrap();
             let action = payload[1]["action"].as_str().unwrap_or("create").to_owned();
-            let result = if action == "create" {
-                json!({"id":"world.created-pack"})
-            } else {
-                json!("world.deleted-pack")
+            // Foundry deletes a world pack by its bare name and prefixes it
+            // itself, so a pack id is refused the way the real server refuses
+            // it. A world that advertises its packs also refuses a name it
+            // does not know, the way the real server refuses it.
+            let name = payload[1]["data"].as_str().unwrap_or_default().to_owned();
+            let known: Option<Vec<String>> = match &state.world {
+                World::Fixture(fixture) => Some(
+                    fixture
+                        .packs
+                        .iter()
+                        .filter(|pack| {
+                            pack.get("id")
+                                .and_then(Value::as_str)
+                                .is_some_and(|id| id.starts_with("world."))
+                        })
+                        .map(|pack| {
+                            pack.get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_owned()
+                        })
+                        .collect(),
+                ),
+                World::Canned { .. } => None,
             };
-            let response = format!(
-                "43{ack}[{}]",
-                json!({"request":{"action":action},"result":result})
-            );
+            let refused = action == "delete"
+                && (name.is_empty()
+                    || name.starts_with("world.")
+                    || known
+                        .as_ref()
+                        .is_some_and(|names| !names.iter().any(|known| known == &name)));
+            let response = if refused {
+                format!(
+                    "43{ack}[{}]",
+                    json!({"request":{"action":action},
+                           "error":{"message":format!("The requested World pack name {name} does not exist")}})
+                )
+            } else {
+                let result = if action == "create" {
+                    json!({"id":"world.created-pack","name":"created-pack","label":"Created Pack","type":"Item"})
+                } else {
+                    json!("world.deleted-pack")
+                };
+                format!(
+                    "43{ack}[{}]",
+                    json!({"request":{"action":action},"result":result})
+                )
+            };
             let _ = sink
                 .lock()
                 .await
@@ -904,6 +955,46 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(packs[0]["id"], "world.items");
+        assert_eq!(packs[0]["name"], "items");
+    }
+
+    #[tokio::test]
+    async fn a_compendium_delete_resolves_the_pack_against_the_worlds_packs() {
+        let world = FakeWorld::start_with_world(WorldFixture::journal_world()).await;
+        let client = FoundryClient::for_loopback(world.base_url()).unwrap();
+        let credential = credential(world.base_url());
+
+        // The pack id a read reports is accepted; Foundry expects the bare
+        // name, and the bare name is accepted as well.
+        for requested in ["world.items", "items"] {
+            let removed = client
+                .delete_compendium(&credential, requested)
+                .await
+                .unwrap();
+            assert_eq!(removed["result"], "world.deleted-pack");
+        }
+        let log = world.request_log();
+        assert!(
+            log.iter().any(|entry| {
+                entry.contains("manageCompendium") && entry.contains("\"data\":\"items\"")
+            }),
+            "the delete did not send the bare pack name: {log:?}"
+        );
+
+        // A package pack is refused, and its bare name is not taken for a
+        // world pack of the same name.
+        let error = client
+            .delete_compendium(&credential, "dnd5e.monsters")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not a world compendium"), "{error}");
+        let error = client
+            .delete_compendium(&credential, "monsters")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not found"), "{error}");
     }
 
     #[tokio::test]

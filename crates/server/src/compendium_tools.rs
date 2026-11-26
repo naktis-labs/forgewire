@@ -6,7 +6,7 @@ use crate::operations::{self, Connector};
 pub fn definitions() -> Vec<Value> {
     vec![
         json!({"name":"create_compendium","description":"Create a world compendium (requires FOUNDRY_ALLOW_WRITES=true).","inputSchema":{"type":"object","properties":{"label":{"type":"string"},"type":{"type":"string"}},"required":["label","type"]}}),
-        json!({"name":"delete_compendium","description":"Permanently delete a world compendium and its contents (requires FOUNDRY_ALLOW_WRITES=true). Use the pack name, not its label.","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}}),
+        json!({"name":"delete_compendium","description":"Permanently delete a world compendium and its contents (requires FOUNDRY_ALLOW_WRITES=true). Pass the pack id the compendium listing reports (world.<name>) or the pack's own name; the pack's label is not accepted, and a package pack cannot be deleted.","inputSchema":{"type":"object","properties":{"name":{"type":"string"}},"required":["name"]}}),
     ]
 }
 

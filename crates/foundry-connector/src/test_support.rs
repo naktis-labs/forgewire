@@ -940,7 +940,14 @@ async fn mutations_share_the_identity_connection_instead_of_opening_a_socket_per
 
 #[tokio::test]
 async fn compendium_management_shares_the_identity_connection() {
-    let fake = FakeFoundry::start_canned("430[{\"world\":{}}]", 14, "s-test").await;
+    // The world advertises the pack the delete names, because the connector
+    // resolves the name against the world's packs.
+    let fake = FakeFoundry::start_canned(
+        "430[{\"world\":{},\"packs\":[{\"id\":\"world.npcs\",\"name\":\"npcs\",\"label\":\"NPCs\",\"type\":\"Actor\",\"packageType\":\"world\"}]}]",
+        14,
+        "s-test",
+    )
+    .await;
     let client = FoundryClient::for_test(&fake.base_url).unwrap();
     let credential = test_credential(&fake.base_url);
 
@@ -952,11 +959,35 @@ async fn compendium_management_shares_the_identity_connection() {
         .await
         .unwrap();
     assert_eq!(created["result"]["id"], "world.created-pack");
+    // The pack id a read reports is accepted; Foundry expects the bare name.
     let removed = client
         .delete_compendium(&credential, "world.npcs")
         .await
         .unwrap();
     assert_eq!(removed["result"], "world.deleted-pack");
+    assert!(
+        fake.request_log().iter().any(|entry| {
+            entry.contains("manageCompendium") && entry.contains("\"data\":\"npcs\"")
+        }),
+        "the delete did not send the bare pack name: {:?}",
+        fake.request_log()
+    );
+
+    // A pack the world does not advertise never reaches the instance.
+    let error = client
+        .delete_compendium(&credential, "world.absent")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("not found"), "{error}");
+    assert!(
+        !fake
+            .request_log()
+            .iter()
+            .any(|entry| entry.contains("\"data\":\"absent\"")),
+        "a refused delete reached the instance: {:?}",
+        fake.request_log()
+    );
 
     assert_eq!(
         socket_count(&fake),

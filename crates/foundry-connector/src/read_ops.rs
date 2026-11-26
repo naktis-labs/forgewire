@@ -164,6 +164,18 @@ fn js_string(v: Option<&Value>) -> String {
         Some(v) => v.to_string(),
     }
 }
+/// Whether a pack belongs to the world rather than to a package.
+///
+/// Only a world pack can be deleted, and only a world pack's name is
+/// meaningful on its own: a system pack's name repeats in the world scope,
+/// so it would name a different pack.
+pub fn is_world_pack(pack: &Value) -> bool {
+    pack.get("packageType").and_then(Value::as_str) == Some("world")
+        || pack
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| id.starts_with("world."))
+}
 pub fn summarize_packs(packs: &Value, document_name: Option<&str>) -> Vec<Value> {
     packs
         .as_array()
@@ -193,8 +205,17 @@ pub fn summarize_packs(packs: &Value, document_name: Option<&str>) -> Vec<Value>
                 );
             }
             for k in ["packageType", "packageName", "system"] {
-                if let Some(v) = p.get(k) {
+                if let Some(v) = p.get(k).filter(|v| !v.is_null()) {
                     out.insert(k.into(), Value::String(js_string(Some(v))));
+                }
+            }
+            // The name is what Foundry's delete takes, so it is reported
+            // next to the id a read identifies the pack by. Only a world
+            // pack has one: a package pack's name repeats in the world
+            // scope and would name a different pack.
+            if is_world_pack(p) {
+                if let Some(v) = p.get("name").filter(|v| !v.is_null()) {
+                    out.insert("name".into(), Value::String(js_string(Some(v))));
                 }
             }
             Value::Object(out)
@@ -375,5 +396,30 @@ mod tests {
         assert!(validate_pack_access(&p, "missing", "Item")
             .unwrap()
             .contains("not found"));
+    }
+
+    #[test]
+    fn only_a_world_pack_reports_its_name() {
+        let p = json!([
+            {"id":"world.npcs","name":"npcs","label":"NPCs","type":"Actor","packageType":"world"},
+            {"id":"dnd5e.items","name":"items","label":"Items","type":"Item","packageType":"system"},
+        ]);
+        let summary = summarize_packs(&p, None);
+        assert_eq!(summary[0]["name"], "npcs");
+        assert!(
+            summary[1].get("name").is_none(),
+            "a package pack must not report a name: {:?}",
+            summary[1]
+        );
+        assert_eq!(summary[1]["id"], "dnd5e.items");
+    }
+
+    #[test]
+    fn a_null_optional_field_is_not_reported_as_the_text_null() {
+        let p =
+            json!([{"id":"world.npcs","label":"NPCs","type":"Actor","name":null,"system":null}]);
+        let summary = summarize_packs(&p, None);
+        assert!(summary[0].get("name").is_none(), "{:?}", summary[0]);
+        assert!(summary[0].get("system").is_none(), "{:?}", summary[0]);
     }
 }
