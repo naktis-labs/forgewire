@@ -23,7 +23,78 @@ protocol simulation, not proof of compatibility with any real Foundry release.
 It does not implement a full Foundry world, and it does not verify uploads or
 arbitrary compendiums.
 
+## Automated live instance (own, disposable)
+
+`crates/server/src/real_world_tests.rs` drives the gateway's REST and MCP
+routes over the real connector against a live Foundry instance. The checks are
+skipped unless `FORGEWIRE_REAL_WORLD_URL` is set, so the ordinary suite never
+touches a real world. They include writes, so the instance must be a world
+that exists to be changed: the checks create, change and delete documents,
+create and delete a compendium, and upload a file.
+
+The instance used for the recorded run was Foundry VTT 14.370 on Node 24.22.1
+with the D&D5e system 6.1.1, listening on loopback only, with a world named
+`forgewire-test` and a game master account that could read and write it.
+
+```sh
+FORGEWIRE_REAL_WORLD_URL=http://127.0.0.1:30000 \
+FORGEWIRE_REAL_WORLD_USERNAME=Gamemaster \
+FORGEWIRE_REAL_WORLD_PASSWORD=THE_DISPOSABLE_PASSWORD \
+  cargo test -p forgewire-server real_world -- --nocapture
+```
+
+`FORGEWIRE_REAL_WORLD_USERID` is optional and only used when the user is known
+by id. The instance has to be reachable over plain HTTP: the loopback client
+is compiled only for this harness and refuses anything but a loopback
+address, so it cannot be pointed at a remote host.
+
+Two more variables describe the instance when it is not the one used for the
+recorded run:
+
+- `FORGEWIRE_REAL_WORLD_DATA_TARGET` is the world's own directory relative to
+  the instance's data root, which is what a browse and an upload name. It
+  defaults to `worlds/forgewire-test`.
+- `FORGEWIRE_REAL_WORLD_SYSTEM` is the system the world is expected to run.
+  When it is set, the world's system has to match it; when it is not, the
+  check only asserts that the world reports a system at all.
+
+A URL without a username is a mistake rather than a reason to skip: the
+checks fail loudly, so a run that was meant to reach a real instance cannot
+pass without doing anything.
+
+The checks share one world, so they take a lock and run one at a time, whether
+or not the test runner runs them in parallel. The documents they create carry
+a per-run suffix, so a run never collides with what an earlier run left
+behind; the compendium keeps a fixed label and is removed again, including
+one an earlier run left behind.
+
+Things the recorded run settled that the fake world could not:
+
+- Foundry only serves a world while that world is launched. A restarted
+  instance answers `/api/status` with `"active": false` and every read and
+  write fails with `Foundry join data did not contain users`, because the
+  join data of a world that is not running carries no users. Launch the world
+  again after every restart.
+- The world data of Foundry 14 lives in a local key-value store under the
+  instance's data directory, not in MongoDB, so no database has to be set up.
+- Foundry's `manageCompendium` delete takes the pack's bare name, while
+  every read identifies a pack by its id (`world.<name>`). The connector
+  resolves the name against the packs the world advertises, so the id and the
+  pack's own name both reach the same pack, and the pack listing reports a
+  world pack's name next to its id. A package pack has no deletable name:
+  its name repeats in the world scope and would name a different pack. A pack
+  the world does not advertise is refused with `400` before the instance sees
+  it, whether it is named by its own name or by a pack id.
+- Foundry 14 refuses `MeasuredTemplate`, a document type it deprecated,
+  without sending an acknowledgement. The gateway reports such a change as
+  `502` with `"outcome": "possibly_applied"`, because there is no answer that
+  proves the outcome.
+- A browse and an upload take a directory relative to the instance's data
+  root, so a world lives under `worlds/<world>`. The instance refuses an
+  upload whose target directory does not exist.
+
 ## Real disposable world (manual, separate environment)
+
 
 **Do not use a production world.** This procedure is for an operator with an
 existing licensed Foundry installation in an isolated environment. Do not

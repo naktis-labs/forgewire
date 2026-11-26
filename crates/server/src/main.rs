@@ -29,6 +29,9 @@ mod packaging_tests;
 #[cfg(test)]
 mod interop_tests;
 
+#[cfg(test)]
+mod real_world_tests;
+
 #[derive(Clone)]
 struct App {
     client: Arc<dyn operations::Connector>,

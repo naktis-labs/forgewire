@@ -61,3 +61,9 @@ MCP clients should use Streamable HTTP at `http://127.0.0.1:8765/mcp`. The curre
 ## Tests
 
 Run `cargo test --workspace`.
+
+A live check against a disposable Foundry instance of your own is available as
+well. `crates/server/src/real_world_tests.rs` is skipped unless
+`FORGEWIRE_REAL_WORLD_URL` is set, and it includes writes, so it may only be
+pointed at a world that exists to be changed. See
+[`docs/interop-harness.md`](docs/interop-harness.md) for the procedure.
