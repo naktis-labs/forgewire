@@ -87,7 +87,9 @@ Things the recorded run settled that the fake world could not:
   it, whether it is named by its own name or by a pack id, because the refusal
   is a lookup miss rather than an upstream fault. A reference that is one
   pack's id and another pack's name at once is refused with `400`, and deletes
-  neither.
+  neither, and a pack the world does not publish a name for is refused with
+  `400` as well: nothing is inferred from the id's shape, because the suffix
+  of an id may be the name of a different pack.
 - Foundry 14 refuses `MeasuredTemplate`, a document type it deprecated,
   without sending an acknowledgement. The gateway reports such a change as
   `502` with `"outcome": "possibly_applied"`, because there is no answer that
