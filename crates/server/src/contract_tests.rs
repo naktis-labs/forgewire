@@ -35,6 +35,10 @@ struct FakeConnector {
     write_result: Value,
     /// How a change fails, when the test asks for a failure.
     write_failure: Mutex<Option<WriteFailure>>,
+    /// Signals that a gated world read has reached the connector.
+    world_entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// Holds a world read until the test releases it.
+    world_gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     calls: Mutex<Vec<String>>,
 }
 
@@ -79,12 +83,31 @@ impl FakeConnector {
             upload_result: json!({"path": "data/upload/song.mp3"}),
             write_result: json!([{"_id": "new-1"}]),
             write_failure: Mutex::new(None),
+            world_entered: Mutex::new(None),
+            world_gate: Mutex::new(None),
             calls: Mutex::new(Vec::new()),
         }
     }
 
     fn record(&self, entry: String) {
         self.calls.lock().unwrap().push(entry);
+    }
+
+    /// Hold the next world read inside the connector.
+    ///
+    /// Returns the signal that fires when the read has reached the
+    /// connector, and the handle that releases it.
+    fn gate_world(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *self.world_entered.lock().unwrap() = Some(entered_tx);
+        *self.world_gate.lock().unwrap() = Some(release_rx);
+        (entered_rx, release_tx)
     }
 
     /// The failure a change reports, when the test asked for one.
@@ -111,6 +134,14 @@ impl FakeConnector {
 impl operations::Connector for FakeConnector {
     async fn world(&self, target: &FoundryCredential) -> anyhow::Result<Value> {
         self.record(format!("world:{}", target.hostname));
+        let entered = self.world_entered.lock().unwrap().take();
+        let gate = self.world_gate.lock().unwrap().take();
+        if let Some(entered) = entered {
+            let _ = entered.send(());
+        }
+        if let Some(gate) = gate {
+            let _ = gate.await;
+        }
         Ok(json!({
             "id": "world-id",
             "title": "Metadata World",
@@ -1207,6 +1238,90 @@ async fn a_change_refused_before_it_reaches_foundry_is_a_caller_mistake() {
     .await;
     assert_eq!(mcp["result"]["isError"], true, "{mcp}");
     assert_eq!(mcp_error_text(&mcp), rest["error"]);
+}
+
+#[tokio::test]
+async fn an_operation_in_flight_keeps_its_target_when_the_selection_changes() {
+    // An operation captures its target when it starts: a later selection
+    // must not retarget work that is still running.
+    let (router, fake) = contract_app(false);
+    let session = mcp_initialize(&router).await;
+    let (entered, release) = fake.gate_world();
+
+    let in_flight_router = router.clone();
+    let in_flight_session = session.clone();
+    let in_flight = tokio::spawn(async move {
+        mcp_call_as(
+            &in_flight_router,
+            Some(&in_flight_session),
+            "get_world",
+            json!({}),
+        )
+        .await
+    });
+    entered
+        .await
+        .expect("the read reached the connector before the selection changed");
+
+    // The client changes its selection while that read is still in flight.
+    let (status, selected) = mcp_call_as(
+        &router,
+        Some(&session),
+        "choose_foundry_instance",
+        json!({"_id":"two"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{selected}");
+    release.send(()).expect("release the held read");
+
+    let (status, mcp) = in_flight.await.unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(mcp["result"]["isError"], false, "{mcp}");
+    assert_eq!(
+        fake.tail(1)[0],
+        "world:one.example",
+        "the in-flight read was retargeted: {:?}",
+        fake.recorded()
+    );
+
+    // The next read uses the new selection.
+    let (_, mcp) = mcp_call_as(&router, Some(&session), "get_world", json!({})).await;
+    assert_eq!(mcp["result"]["isError"], false, "{mcp}");
+    assert_eq!(
+        fake.tail(1)[0],
+        "world:two.example",
+        "the selection did not move: {:?}",
+        fake.recorded()
+    );
+}
+
+#[tokio::test]
+async fn rest_and_mcp_carry_the_same_embedded_and_pack_target_to_the_connector() {
+    // A change to an embedded document or a pack document must reach the
+    // connector with the same target on both transports.
+    let (router, fake) = contract_app_with_token(true);
+    let args = json!({
+        "kind":"Actor",
+        "data":[{"name":"Nested"}],
+        "parent_uuid":"Actor.parent-1",
+        "pack":"pack-core",
+    });
+    let (status, rest) = rest_send(
+        &router,
+        "POST",
+        "/api/write/create_document",
+        Some(args.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rest}");
+    let (_, mcp) = mcp_call(&router, "create_document", args).await;
+    assert_eq!(rest, mcp_value(&mcp));
+    assert_transports_matched(&fake);
+
+    let calls = fake.recorded();
+    let last = calls.last().expect("a connector call");
+    assert!(last.contains("Some(\"Actor.parent-1\")"), "{calls:?}");
+    assert!(last.contains("Some(\"pack-core\")"), "{calls:?}");
 }
 
 #[tokio::test]
