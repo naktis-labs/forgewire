@@ -664,44 +664,13 @@ fn ambiguity(mutation: bool) -> &'static str {
 
 impl Transport {
     fn start(socket: Socket, active_epoch: Arc<std::sync::atomic::AtomicU64>, epoch: u64) -> Self {
-        let (sender, mut receiver) = mpsc::channel::<Outbound>(64);
+        let (sender, receiver) = mpsc::channel::<Outbound>(64);
         let mux = crate::socket_mux::SocketMux::new(128, 64);
         let reader_mux = mux.clone();
         let reader_epoch = active_epoch.clone();
         tokio::spawn(async move {
-            let (mut sink, mut stream) = socket.split();
-            loop {
-                tokio::select! {
-                    outgoing = receiver.recv() => match outgoing {
-                        Some(outbound) => {
-                            match write_outbound(&mut sink, outbound).await {
-                                FrameWrite::Written => {}
-                                // The request gave up before the writer took
-                                // the frame: the frame was not written and
-                                // the socket stays usable.
-                                FrameWrite::Skipped => {}
-                                FrameWrite::Failed => break,
-                            }
-                        }
-                        None => break,
-                    },
-                    incoming = stream.next() => match incoming {
-                        Some(Ok(Message::Text(text))) => {
-                            if let Some(pong) = crate::socket_mux::pong_for_ping(text.as_str()) {
-                                let pong = timeout(crate::WRITE_TIMEOUT, sink.send(Message::Text(pong.into()))).await;
-                                if !matches!(pong, Ok(Ok(()))) { break; }
-                            } else if reader_mux.receive(text.as_str()) {
-                                invalidate_epoch(&reader_epoch, epoch);
-                                break;
-                            }
-                        }
-                        Some(Ok(_)) => {},
-                        _ => break,
-                    }
-                }
-            }
-            invalidate_epoch(&reader_epoch, epoch);
-            reader_mux.disconnect();
+            let (sink, stream) = socket.split();
+            writer_loop(sink, stream, receiver, reader_mux, reader_epoch, epoch).await;
         });
         Self { sender, mux, epoch }
     }
@@ -745,6 +714,58 @@ where
     } else {
         FrameWrite::Written
     }
+}
+
+/// The writer task: hand queued frames to the socket and dispatch the
+/// answers that come back.
+///
+/// A frame whose request gave up is dropped, and the writer keeps running:
+/// the socket is still usable for the other requests on the connection. Only
+/// a failed write ends the writer.
+async fn writer_loop<S, R, E>(
+    mut sink: S,
+    mut stream: R,
+    mut receiver: mpsc::Receiver<Outbound>,
+    reader_mux: crate::socket_mux::SocketMux,
+    reader_epoch: Arc<std::sync::atomic::AtomicU64>,
+    epoch: u64,
+) where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+    R: futures_util::Stream<Item = std::result::Result<Message, E>> + Unpin,
+{
+    loop {
+        tokio::select! {
+            outgoing = receiver.recv() => match outgoing {
+                Some(outbound) => {
+                    match write_outbound(&mut sink, outbound).await {
+                        FrameWrite::Written => {}
+                        // The request gave up before the writer took
+                        // the frame: the frame was not written and
+                        // the socket stays usable.
+                        FrameWrite::Skipped => {}
+                        FrameWrite::Failed => break,
+                    }
+                }
+                None => break,
+            },
+            incoming = stream.next() => match incoming {
+                Some(Ok(Message::Text(text))) => {
+                    if let Some(pong) = crate::socket_mux::pong_for_ping(text.as_str()) {
+                        let pong = timeout(crate::WRITE_TIMEOUT, sink.send(Message::Text(pong.into()))).await;
+                        if !matches!(pong, Ok(Ok(()))) { break; }
+                    } else if reader_mux.receive(text.as_str()) {
+                        invalidate_epoch(&reader_epoch, epoch);
+                        break;
+                    }
+                }
+                Some(Ok(_)) => {},
+                _ => break,
+            }
+        }
+    }
+    invalidate_epoch(&reader_epoch, epoch);
+    reader_mux.disconnect();
 }
 
 /// Enqueue a frame and wait for the writer to report its outcome.
@@ -1342,6 +1363,134 @@ mod tests {
             failure.may_have_been_applied(),
             "the frame was taken for transmission, so the outcome is unknown"
         );
+    }
+
+    /// A change whose frame was already on its way keeps the ambiguous
+    /// outcome: it may have been applied.
+    #[tokio::test]
+    async fn a_change_whose_frame_was_already_on_its_way_is_ambiguous() {
+        let (manager, key, mut receiver) = manager_with_queued_transport(11).await;
+        let request = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                manager
+                    .exchange(
+                        key,
+                        crate::socket_mux::Request::Document {
+                            document: "Actor".into(),
+                            action: "update".into(),
+                            operation: serde_json::json!({"action": "update"}),
+                        },
+                        "document",
+                        || async { Err(anyhow::anyhow!("the transport is already installed")) },
+                    )
+                    .await
+            }
+        });
+        let outbound = receiver.recv().await.expect("the frame was enqueued");
+        // The writer took the frame for transmission, so it may have reached
+        // the instance.
+        assert!(
+            outbound.frame.claim(),
+            "the writer takes the frame for transmission"
+        );
+        drop(outbound);
+
+        let error = request.await.unwrap().unwrap_err();
+        assert!(
+            error.downcast_ref::<crate::AmbiguousMutation>().is_some(),
+            "the frame was on its way, so the outcome is unknown: {error}"
+        );
+        assert!(
+            error.to_string().contains("may have been applied"),
+            "{error}"
+        );
+    }
+
+    /// The world read reports no outcome: it changes nothing, so it is never
+    /// an ambiguous mutation.
+    #[tokio::test]
+    async fn a_world_read_that_never_reached_the_socket_reports_no_outcome() {
+        let (manager, key, mut receiver) = manager_with_queued_transport(13).await;
+        let request = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                manager
+                    .world(key, || async {
+                        Err(anyhow::anyhow!("the transport is already installed"))
+                    })
+                    .await
+            }
+        });
+        let outbound = receiver.recv().await.expect("the frame was enqueued");
+        drop(outbound);
+
+        let error = request.await.unwrap().unwrap_err();
+        assert!(
+            error.downcast_ref::<crate::AmbiguousMutation>().is_none(),
+            "a read changes nothing, so its outcome is not ambiguous: {error}"
+        );
+        assert!(
+            !error.to_string().contains("may have been applied"),
+            "{error}"
+        );
+    }
+
+    /// A frame whose request gave up is dropped, and the writer keeps
+    /// running: the socket stays usable for the next frame.
+    #[tokio::test]
+    async fn a_skipped_frame_keeps_the_writer_running() {
+        let (sender, receiver) = mpsc::channel::<Outbound>(4);
+        let mux = crate::socket_mux::SocketMux::new(4, 4);
+        let socket = RecordingSocket::default();
+        let writer = tokio::spawn({
+            let sink = socket.clone();
+            let epoch = Arc::new(std::sync::atomic::AtomicU64::new(1));
+            async move {
+                super::writer_loop(
+                    sink,
+                    futures_util::stream::pending::<std::result::Result<Message, std::io::Error>>(),
+                    receiver,
+                    mux,
+                    epoch,
+                    1,
+                )
+                .await;
+            }
+        });
+
+        // A frame whose request gave up is dropped, not written.
+        let frame = crate::socket_mux::FrameHandle::new();
+        let (written, outcome) = oneshot::channel();
+        sender
+            .send(Outbound {
+                message: Message::Text("cancelled-frame".into()),
+                written,
+                frame: frame.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(frame.cancel(), "the request takes its frame");
+        assert_eq!(
+            outcome.await.expect("the writer reports the skipped frame"),
+            Err("cancelled before writing".to_owned())
+        );
+
+        // The writer is still running: the next frame reaches the socket.
+        let (written, outcome) = oneshot::channel();
+        sender
+            .send(Outbound {
+                message: Message::Text("written-frame".into()),
+                written,
+                frame: crate::socket_mux::FrameHandle::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome.await.expect("the writer reports the write"), Ok(()));
+        assert_eq!(socket.frames(), vec!["written-frame".to_owned()]);
+
+        drop(sender);
+        let _ = writer.await;
     }
 
     #[tokio::test]
