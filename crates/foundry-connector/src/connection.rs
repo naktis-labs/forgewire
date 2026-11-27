@@ -853,6 +853,7 @@ fn safely_idle(connection: &Arc<Connection>) -> bool {
 mod tests {
     use super::{
         enqueue_with_deadline, invalidate_epoch, ConnectionManager, IdentityKey, Outbound,
+        Transport,
     };
     use std::{
         sync::{
@@ -1077,6 +1078,272 @@ mod tests {
         );
     }
 
+    /// A transport whose queue the test holds: no writer takes the frames, so
+    /// a frame stays queued until the test lets a writer take it.
+    fn queued_transport(epoch: u64) -> (Transport, mpsc::Receiver<Outbound>) {
+        let (sender, receiver) = mpsc::channel::<Outbound>(8);
+        (
+            Transport {
+                sender,
+                mux: crate::socket_mux::SocketMux::new(8, 8),
+                epoch,
+            },
+            receiver,
+        )
+    }
+
+    /// A manager whose identity already owns a transport, so a request runs
+    /// on it without connecting.
+    async fn manager_with_queued_transport(
+        epoch: u64,
+    ) -> (
+        Arc<ConnectionManager>,
+        IdentityKey,
+        mpsc::Receiver<Outbound>,
+    ) {
+        let manager = ConnectionManager::with_limits(1, Duration::from_secs(60));
+        let key = IdentityKey::new(&["queued-transport"]);
+        let connection = manager.reserve(key.clone()).await.unwrap();
+        connection.epoch.store(epoch, Ordering::Release);
+        let (transport, receiver) = queued_transport(epoch);
+        *connection.transport.lock().await = Some(transport);
+        (Arc::new(manager), key, receiver)
+    }
+
+    /// A change whose frame never reached the socket is a definite failure,
+    /// not an ambiguous one: the caller can tell it apart from a change that
+    /// may have been applied.
+    #[tokio::test]
+    async fn a_change_whose_frame_never_reached_the_socket_is_not_ambiguous() {
+        let (manager, key, mut receiver) = manager_with_queued_transport(7).await;
+        let request = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                manager
+                    .exchange(
+                        key,
+                        crate::socket_mux::Request::Document {
+                            document: "Actor".into(),
+                            action: "update".into(),
+                            operation: serde_json::json!({"action": "update"}),
+                        },
+                        "document",
+                        || async { Err(anyhow::anyhow!("the transport is already installed")) },
+                    )
+                    .await
+            }
+        });
+        // The frame is queued and no writer takes it.
+        let outbound = receiver.recv().await.expect("the frame was enqueued");
+        // The writer goes away without writing: the frame never reaches the
+        // socket.
+        drop(outbound);
+
+        let error = request.await.unwrap().unwrap_err();
+        assert!(
+            error.downcast_ref::<crate::AmbiguousMutation>().is_none(),
+            "the frame never reached the socket, so the outcome is known: {error}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("not transmitted"),
+            "the failure must say the request was not transmitted: {message}"
+        );
+        assert!(
+            !message.contains("may have been applied"),
+            "the change did not happen: {message}"
+        );
+    }
+
+    /// A definite write failure leaves the other requests on the same
+    /// connection alone: the shared socket is not torn down for a frame that
+    /// never reached it.
+    #[tokio::test]
+    async fn a_definite_write_failure_leaves_another_request_alone() {
+        let (manager, key, mut receiver) = manager_with_queued_transport(9).await;
+        // Another request is in flight on the same connection.
+        let connection = manager.reserve(key.clone()).await.unwrap();
+        let transport = connection.transport.lock().await.clone().unwrap();
+        let (pending, _) = transport
+            .mux
+            .begin(crate::socket_mux::Request::Document {
+                document: "Actor".into(),
+                action: "get".into(),
+                operation: serde_json::json!({"action": "get"}),
+            })
+            .unwrap();
+
+        let request = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                manager
+                    .exchange(
+                        key,
+                        crate::socket_mux::Request::Document {
+                            document: "Actor".into(),
+                            action: "update".into(),
+                            operation: serde_json::json!({"action": "update"}),
+                        },
+                        "document",
+                        || async { Err(anyhow::anyhow!("the transport is already installed")) },
+                    )
+                    .await
+            }
+        });
+        let outbound = receiver.recv().await.expect("the frame was enqueued");
+        drop(outbound);
+        let error = request.await.unwrap().unwrap_err();
+        assert!(
+            error.downcast_ref::<crate::AmbiguousMutation>().is_none(),
+            "the frame never reached the socket: {error}"
+        );
+
+        // The other request is still pending and can still be answered: the
+        // connection was not torn down.
+        assert_eq!(transport.mux.pending_count(), 1);
+        let id = pending.id();
+        transport.mux.receive(&format!(
+            "43{id}[{{\"type\":\"Actor\",\"action\":\"get\",\"result\":[]}}]"
+        ));
+        assert!(
+            pending.wait().await.is_ok(),
+            "the other request must still be answered"
+        );
+    }
+
+    /// A cancelled request takes only its own frame: another request's frame
+    /// on the same connection is still written, and the socket stays usable.
+    #[tokio::test]
+    async fn a_cancelled_request_takes_only_its_own_frame() {
+        let mux = crate::socket_mux::SocketMux::new(2, 2);
+        let (first, first_text) = mux
+            .begin(crate::socket_mux::Request::Document {
+                document: "Actor".into(),
+                action: "update".into(),
+                operation: serde_json::json!({"action": "update"}),
+            })
+            .unwrap();
+        let (second, second_text) = mux
+            .begin(crate::socket_mux::Request::Document {
+                document: "Item".into(),
+                action: "update".into(),
+                operation: serde_json::json!({"action": "update"}),
+            })
+            .unwrap();
+        let (sender, mut receiver) = mpsc::channel::<Outbound>(4);
+
+        let first_request = tokio::spawn({
+            let sender = sender.clone();
+            let frame = first.frame();
+            async move {
+                enqueue_with_deadline(
+                    &sender,
+                    Message::Text(first_text.into()),
+                    frame,
+                    Duration::from_secs(30),
+                )
+                .await
+            }
+        });
+        let first_outbound = receiver.recv().await.expect("the first frame");
+        // The first request gives up while its frame is still queued.
+        first_request.abort();
+        let _ = first_request.await;
+
+        let second_request = tokio::spawn({
+            let sender = sender.clone();
+            let frame = second.frame();
+            async move {
+                enqueue_with_deadline(
+                    &sender,
+                    Message::Text(second_text.into()),
+                    frame,
+                    Duration::from_secs(30),
+                )
+                .await
+            }
+        });
+        let second_outbound = receiver.recv().await.expect("the second frame");
+
+        // The writer takes both frames: the first one is dropped, and the
+        // second one is written to the socket, which stays usable.
+        let socket = RecordingSocket::default();
+        let mut sink = socket.clone();
+        assert!(
+            matches!(
+                super::write_outbound(&mut sink, first_outbound).await,
+                super::FrameWrite::Skipped
+            ),
+            "the writer must skip a frame whose request gave up"
+        );
+        assert!(
+            matches!(
+                super::write_outbound(&mut sink, second_outbound).await,
+                super::FrameWrite::Written
+            ),
+            "the writer must write the other request's frame"
+        );
+        assert_eq!(
+            socket.frames().len(),
+            1,
+            "only the other request's frame reaches the socket"
+        );
+        second_request.await.unwrap().unwrap();
+    }
+
+    /// A write deadline that expires while the frame is still queued is a
+    /// definite failure: the frame never reached the socket.
+    #[tokio::test]
+    async fn a_write_deadline_before_the_writer_took_the_frame_is_definite() {
+        let (sender, _receiver) = mpsc::channel::<Outbound>(4);
+        let frame = crate::socket_mux::FrameHandle::new();
+        let failure = enqueue_with_deadline(
+            &sender,
+            Message::Text("never-written".into()),
+            frame,
+            Duration::from_millis(20),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            !failure.may_have_been_applied(),
+            "the frame never reached the socket, so the outcome is known"
+        );
+    }
+
+    /// A write deadline that expires after the writer took the frame stays
+    /// ambiguous: the frame may have reached the socket.
+    #[tokio::test]
+    async fn a_write_deadline_after_the_writer_took_the_frame_stays_ambiguous() {
+        let (sender, mut receiver) = mpsc::channel::<Outbound>(4);
+        let frame = crate::socket_mux::FrameHandle::new();
+        let request = tokio::spawn({
+            let sender = sender.clone();
+            let frame = frame.clone();
+            async move {
+                enqueue_with_deadline(
+                    &sender,
+                    Message::Text("written-frame".into()),
+                    frame,
+                    Duration::from_millis(20),
+                )
+                .await
+            }
+        });
+        let outbound = receiver.recv().await.expect("the frame was enqueued");
+        // The writer took the frame before the deadline expired.
+        assert!(
+            outbound.frame.claim(),
+            "the writer takes the frame for transmission"
+        );
+
+        let failure = request.await.unwrap().unwrap_err();
+        assert!(
+            failure.may_have_been_applied(),
+            "the frame was taken for transmission, so the outcome is unknown"
+        );
+    }
+
     #[tokio::test]
     async fn terminal_connect_error_is_attempted_once() {
         let policy = super::ReconnectPolicy {
@@ -1269,6 +1536,10 @@ mod tests {
         assert!(error
             .to_string()
             .contains("writing Foundry websocket request"));
+        assert!(
+            !error.may_have_been_applied(),
+            "the frame never reached the socket, so the outcome is known"
+        );
     }
 
     #[tokio::test]

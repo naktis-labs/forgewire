@@ -786,6 +786,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_dropped_request_takes_its_frame_with_it() {
+        let mux = SocketMux::new(2, 2);
+        let (document, _) = mux
+            .begin(Request::Document {
+                document: "Actor".into(),
+                action: "update".into(),
+                operation: json!({"action":"update"}),
+            })
+            .unwrap();
+        let frame = document.frame();
+        drop(document);
+        assert!(
+            !frame.claim(),
+            "a request that gave up takes its frame, so the writer cannot write it"
+        );
+
+        // The same holds for a world request, and its slot is not quarantined
+        // either: no late answer can arrive for a frame that was never
+        // written.
+        let (world, _) = mux.begin(Request::World).unwrap();
+        let frame = world.frame();
+        drop(world);
+        assert!(
+            !frame.claim(),
+            "a world request that gave up takes its frame"
+        );
+        assert!(
+            mux.begin(Request::World).is_ok(),
+            "the world slot is not quarantined for a frame that was never written"
+        );
+    }
+
+    #[tokio::test]
     async fn disconnect_during_inflight_mutation_is_conservatively_ambiguous() {
         let mux = SocketMux::new(1, 1);
         let (mutation, _) = mux
