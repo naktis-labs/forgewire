@@ -54,6 +54,52 @@ struct Connection {
 struct Outbound {
     message: Message,
     written: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    /// The lifecycle of the frame, shared with the request that owns it.
+    frame: crate::socket_mux::FrameHandle,
+}
+
+/// How a failed write is classified.
+///
+/// A frame the writer never took cannot have reached the instance, so the
+/// operation certainly did not happen. A frame the writer took may have
+/// reached it, so the outcome stays unknown.
+#[derive(Debug)]
+enum WriteFailure {
+    NotTransmitted(anyhow::Error),
+    Transmitted(anyhow::Error),
+}
+
+impl WriteFailure {
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            WriteFailure::NotTransmitted(error) | WriteFailure::Transmitted(error) => error,
+        }
+    }
+    /// Whether the failure leaves the outcome of a mutation unknown.
+    fn may_have_been_applied(&self) -> bool {
+        matches!(self, WriteFailure::Transmitted(_))
+    }
+}
+
+impl std::fmt::Display for WriteFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WriteFailure::NotTransmitted(error) | WriteFailure::Transmitted(error) => {
+                write!(formatter, "{error}")
+            }
+        }
+    }
+}
+
+/// What the writer did with one queued frame.
+enum FrameWrite {
+    /// The frame reached the socket.
+    Written,
+    /// The request gave up before the writer took the frame: the frame was
+    /// not written and the socket stays usable.
+    Skipped,
+    /// The writer took the frame and the write failed: the socket is gone.
+    Failed,
 }
 
 #[derive(Clone)]
@@ -428,19 +474,41 @@ impl ConnectionManager {
                 "Foundry {label} request was cancelled before writing"
             ));
         }
-        if let Err(error) = transport.write(Message::Text(frame.into())).await {
-            transport.mux.disconnect();
-            invalidate_epoch(&connection.epoch, transport.epoch);
-            in_flight.3 = false;
-            let message = format!(
-                "Failed writing Foundry {label} request{}: {error}",
-                ambiguity(mutation)
-            );
-            return Err(if mutation {
-                crate::ambiguous_mutation(message)
-            } else {
-                anyhow!(message)
-            });
+        match transport
+            .write(Message::Text(frame.into()), pending.frame())
+            .await
+        {
+            Ok(()) => {}
+            Err(failure) => {
+                let ambiguous = failure.may_have_been_applied();
+                if ambiguous {
+                    // The writer took the frame, so the socket may still be
+                    // carrying it: the connection cannot be trusted any more.
+                    transport.mux.disconnect();
+                    invalidate_epoch(&connection.epoch, transport.epoch);
+                }
+                in_flight.3 = false;
+                let error = failure.into_error();
+                let message = if ambiguous {
+                    format!(
+                        "Failed writing Foundry {label} request{}: {error}",
+                        ambiguity(mutation)
+                    )
+                } else if mutation {
+                    format!(
+                        "Failed writing Foundry {label} request: {error}; the request was not transmitted, so the operation was not applied"
+                    )
+                } else {
+                    format!(
+                        "Failed writing Foundry {label} request: {error}; the request was not transmitted"
+                    )
+                };
+                return Err(if ambiguous && mutation {
+                    crate::ambiguous_mutation(message)
+                } else {
+                    anyhow!(message)
+                });
+            }
         }
         match timeout(crate::RESPONSE_TIMEOUT, pending.wait()).await {
             Ok(Ok(value)) => {
@@ -459,10 +527,11 @@ impl ConnectionManager {
                 // is healthy, so the connection stays in use for other
                 // requests.
                 in_flight.3 = false;
-                Err(if mutation {
-                    crate::ambiguous_mutation(error.message().to_owned())
+                let message = error.message().to_owned();
+                Err(if mutation && error.is_ambiguous() {
+                    crate::ambiguous_mutation(message)
                 } else {
-                    anyhow!(error.message().to_owned())
+                    anyhow!(message)
                 })
             }
             Err(_) => {
@@ -527,17 +596,24 @@ impl ConnectionManager {
                 true,
             );
             let write = if transport.mux.mark_sent(pending.id()) {
-                transport.write(Message::Text(frame.into())).await
+                transport
+                    .write(Message::Text(frame.into()), pending.frame())
+                    .await
             } else {
-                Err(anyhow!(
+                Err(WriteFailure::NotTransmitted(anyhow!(
                     "Foundry world request was cancelled before writing"
-                ))
+                )))
             };
-            if let Err(error) = write {
-                transport.mux.disconnect();
-                invalidate_epoch(&connection.epoch, transport.epoch);
+            if let Err(failure) = write {
+                if failure.may_have_been_applied() {
+                    transport.mux.disconnect();
+                    invalidate_epoch(&connection.epoch, transport.epoch);
+                }
                 in_flight.3 = false;
-                return Err(anyhow!("Failed writing Foundry world request: {error}"));
+                return Err(anyhow!(
+                    "Failed writing Foundry world request: {}",
+                    failure.into_error()
+                ));
             }
             return match timeout(crate::RESPONSE_TIMEOUT, pending.wait()).await {
                 Ok(Ok(value)) => {
@@ -598,14 +674,14 @@ impl Transport {
                 tokio::select! {
                     outgoing = receiver.recv() => match outgoing {
                         Some(outbound) => {
-                            let result = match timeout(crate::WRITE_TIMEOUT, sink.send(outbound.message)).await {
-                                Ok(Ok(())) => Ok(()),
-                                Ok(Err(error)) => Err(error.to_string()),
-                                Err(_) => Err("timed out writing Foundry websocket request".to_owned()),
-                            };
-                            let failed = result.is_err();
-                            let _ = outbound.written.send(result);
-                            if failed { break; }
+                            match write_outbound(&mut sink, outbound).await {
+                                FrameWrite::Written => {}
+                                // The request gave up before the writer took
+                                // the frame: the frame was not written and
+                                // the socket stays usable.
+                                FrameWrite::Skipped => {}
+                                FrameWrite::Failed => break,
+                            }
                         }
                         None => break,
                     },
@@ -630,21 +706,68 @@ impl Transport {
         Self { sender, mux, epoch }
     }
 
-    async fn write(&self, message: Message) -> Result<()> {
-        enqueue_with_deadline(&self.sender, message, crate::WRITE_TIMEOUT).await
+    async fn write(
+        &self,
+        message: Message,
+        frame: crate::socket_mux::FrameHandle,
+    ) -> Result<(), WriteFailure> {
+        enqueue_with_deadline(&self.sender, message, frame, crate::WRITE_TIMEOUT).await
     }
 }
 
+/// Write one queued frame to the socket.
+///
+/// The frame is taken for transmission before the write begins. A request
+/// that gives up while its frame is still queued takes the frame with it,
+/// and the writer then drops the frame instead of handing a stale frame to
+/// the instance.
+async fn write_outbound<S>(sink: &mut S, outbound: Outbound) -> FrameWrite
+where
+    S: futures_util::Sink<Message> + Unpin,
+    S::Error: std::fmt::Display,
+{
+    if !outbound.frame.claim() {
+        let _ = outbound
+            .written
+            .send(Err("cancelled before writing".to_owned()));
+        return FrameWrite::Skipped;
+    }
+    let result: std::result::Result<(), String> =
+        match timeout(crate::WRITE_TIMEOUT, sink.send(outbound.message)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(error.to_string()),
+            Err(_) => Err("timed out writing Foundry websocket request".to_owned()),
+        };
+    let failed = result.is_err();
+    let _ = outbound.written.send(result);
+    if failed {
+        FrameWrite::Failed
+    } else {
+        FrameWrite::Written
+    }
+}
+
+/// Enqueue a frame and wait for the writer to report its outcome.
+///
+/// The frame is cancelled when this future is dropped before the writer took
+/// it, so a request that gives up never leaves a stale frame behind for the
+/// writer to send.
 async fn enqueue_with_deadline(
     sender: &mpsc::Sender<Outbound>,
     message: Message,
+    frame: crate::socket_mux::FrameHandle,
     deadline: Duration,
-) -> Result<()> {
-    crate::write_with_deadline(
+) -> Result<(), WriteFailure> {
+    let guard = FrameGuard(frame.clone());
+    let outcome = crate::write_with_deadline(
         async {
             let (written, result) = tokio::sync::oneshot::channel();
             sender
-                .send(Outbound { message, written })
+                .send(Outbound {
+                    message,
+                    written,
+                    frame: frame.clone(),
+                })
                 .await
                 .map_err(|_| anyhow!("Foundry websocket writer stopped"))?;
             result
@@ -656,7 +779,28 @@ async fn enqueue_with_deadline(
         deadline,
         "writing Foundry websocket request",
     )
-    .await?
+    .await;
+    // The frame is given up before the writer took it, unless the writer
+    // already took it: the frame's state decides whether the outcome of the
+    // operation is known.
+    drop(guard);
+    match outcome {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) | Err(error) => Err(if frame.may_have_been_transmitted() {
+            WriteFailure::Transmitted(error)
+        } else {
+            WriteFailure::NotTransmitted(error)
+        }),
+    }
+}
+
+/// Gives up a frame that was queued but not taken by the writer.
+struct FrameGuard(crate::socket_mux::FrameHandle);
+
+impl Drop for FrameGuard {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
 }
 
 impl Drop for ConnectionManager {
@@ -737,6 +881,200 @@ mod tests {
         assert_eq!(active_epoch.load(Ordering::Acquire), 2);
         invalidate_epoch(&active_epoch, 2);
         assert_eq!(active_epoch.load(Ordering::Acquire), 0);
+    }
+
+    /// A socket that records the frames that reach it.
+    #[derive(Clone, Default)]
+    struct RecordingSocket(Arc<std::sync::Mutex<Vec<Message>>>);
+
+    impl RecordingSocket {
+        fn frames(&self) -> Vec<String> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|message| match message {
+                    Message::Text(text) => text.as_str().to_owned(),
+                    other => format!("{other:?}"),
+                })
+                .collect()
+        }
+    }
+
+    impl futures_util::Sink<Message> for RecordingSocket {
+        type Error = std::io::Error;
+
+        fn poll_ready(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: std::pin::Pin<&mut Self>, item: Message) -> Result<(), Self::Error> {
+            self.0.lock().unwrap().push(item);
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Queue a mutation frame the way a request does, and hand the queued
+    /// frame to the caller so that it can act as the writer.
+    ///
+    /// The frame is queued but not taken: the writer is prevented from
+    /// transmitting it, which is the window a cancelled request's frame used
+    /// to survive in.
+    async fn queue_mutation_frame() -> (
+        crate::socket_mux::SocketMux,
+        crate::socket_mux::PendingRequest,
+        mpsc::Receiver<Outbound>,
+        tokio::task::JoinHandle<Result<(), super::WriteFailure>>,
+    ) {
+        let mux = crate::socket_mux::SocketMux::new(1, 1);
+        let (pending, frame) = mux
+            .begin(crate::socket_mux::Request::Document {
+                document: "Actor".into(),
+                action: "update".into(),
+                operation: serde_json::json!({"action": "update"}),
+            })
+            .unwrap();
+        let (sender, receiver) = mpsc::channel::<Outbound>(4);
+        let request = tokio::spawn({
+            let sender = sender.clone();
+            let handle = pending.frame();
+            async move {
+                enqueue_with_deadline(
+                    &sender,
+                    Message::Text(frame.into()),
+                    handle,
+                    Duration::from_secs(30),
+                )
+                .await
+            }
+        });
+        (mux, pending, receiver, request)
+    }
+
+    /// A mutation that was queued but not yet written must not reach the
+    /// instance when its request is cancelled.
+    #[tokio::test]
+    async fn a_cancelled_request_never_transmits_its_queued_frame() {
+        let (_mux, _pending, mut receiver, request) = queue_mutation_frame().await;
+        // The frame was enqueued successfully and the writer has not taken
+        // it: the writer is prevented from transmitting it.
+        let outbound = receiver.recv().await.expect("the frame was enqueued");
+
+        // The request is cancelled while its frame is still queued.
+        request.abort();
+        let _ = request.await;
+
+        // The writer takes the frame afterwards: it must drop it instead of
+        // handing a stale frame to the instance.
+        let socket = RecordingSocket::default();
+        let mut sink = socket.clone();
+        assert!(
+            matches!(
+                super::write_outbound(&mut sink, outbound).await,
+                super::FrameWrite::Skipped
+            ),
+            "the writer must skip a frame whose request was cancelled"
+        );
+        assert!(
+            socket.frames().is_empty(),
+            "the cancelled frame reached the socket: {:?}",
+            socket.frames()
+        );
+    }
+
+    /// A mutation that was queued but not yet written must not reach the
+    /// instance when its connection is invalidated, and the request must be
+    /// told that the operation did not happen.
+    #[tokio::test]
+    async fn an_invalidated_connection_never_transmits_its_queued_frame() {
+        let (mux, pending, mut receiver, request) = queue_mutation_frame().await;
+        let outbound = receiver.recv().await.expect("the frame was enqueued");
+
+        // The connection is invalidated while the frame is still queued.
+        mux.disconnect();
+
+        let socket = RecordingSocket::default();
+        let mut sink = socket.clone();
+        assert!(
+            matches!(
+                super::write_outbound(&mut sink, outbound).await,
+                super::FrameWrite::Skipped
+            ),
+            "the writer must skip a frame whose connection was invalidated"
+        );
+        assert!(
+            socket.frames().is_empty(),
+            "the stale frame reached the socket: {:?}",
+            socket.frames()
+        );
+
+        // The request learns that the operation certainly did not happen.
+        let failure = request.await.unwrap().unwrap_err();
+        assert!(
+            !failure.may_have_been_applied(),
+            "the frame was never transmitted, so the outcome is known"
+        );
+        let error = pending.wait().await.unwrap_err();
+        assert!(
+            !error.is_ambiguous(),
+            "the frame was never transmitted, so the outcome is known"
+        );
+    }
+
+    /// A mutation whose frame the writer already took may have reached the
+    /// instance: its outcome stays unknown.
+    #[tokio::test]
+    async fn a_frame_the_writer_took_may_have_been_applied() {
+        let (mux, pending, mut receiver, request) = queue_mutation_frame().await;
+        let outbound = receiver.recv().await.expect("the frame was enqueued");
+
+        // The writer takes the frame and writes it to the socket.
+        let socket = RecordingSocket::default();
+        let mut sink = socket.clone();
+        assert!(
+            matches!(
+                super::write_outbound(&mut sink, outbound).await,
+                super::FrameWrite::Written
+            ),
+            "the writer must write a frame it took"
+        );
+        assert_eq!(
+            socket.frames().len(),
+            1,
+            "the frame the writer took reaches the socket"
+        );
+        request.await.unwrap().unwrap();
+
+        // The connection is invalidated before the instance answers: the
+        // frame may have been applied, so the outcome stays unknown.
+        mux.disconnect();
+        let error = pending.wait().await.unwrap_err();
+        assert!(
+            error.is_ambiguous(),
+            "the frame was transmitted, so the outcome is unknown"
+        );
+        assert!(
+            error.message().contains("may have been applied"),
+            "{}",
+            error.message()
+        );
     }
 
     #[tokio::test]
@@ -914,6 +1252,7 @@ mod tests {
             .send(Outbound {
                 message: Message::Text("occupies-channel".into()),
                 written,
+                frame: super::super::socket_mux::FrameHandle::new(),
             })
             .await
             .unwrap();
@@ -921,6 +1260,7 @@ mod tests {
         let error = enqueue_with_deadline(
             &sender,
             Message::Text("blocked-by-full-channel".into()),
+            super::super::socket_mux::FrameHandle::new(),
             Duration::from_millis(1),
         )
         .await
@@ -942,6 +1282,7 @@ mod tests {
             .send(Outbound {
                 message: Message::Text("occupies-channel".into()),
                 written,
+                frame: super::super::socket_mux::FrameHandle::new(),
             })
             .await
             .unwrap();
@@ -956,6 +1297,7 @@ mod tests {
             enqueue_with_deadline(
                 &sender,
                 Message::Text("cancelled-frame".into()),
+                super::super::socket_mux::FrameHandle::new(),
                 Duration::from_secs(30),
             )
             .await

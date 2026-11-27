@@ -1,7 +1,7 @@
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, VecDeque},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicU64, AtomicU8, Ordering},
     sync::{Arc, Mutex, Weak},
 };
 use tokio::sync::oneshot;
@@ -36,6 +36,84 @@ enum Expectation {
     Files,
 }
 
+/// Where a queued frame is on its way to the socket.
+///
+/// The state is shared by the request that owns the frame, the writer task
+/// and the pending registry, so that all three agree on whether the frame
+/// was handed to the socket. Only the writer may move a frame from
+/// `Queued` to `Transmitting`, and only the owner of a request may move it
+/// from `Queued` to `Cancelled`. Whichever happens first decides the fate
+/// of the frame: a cancelled frame never reaches the instance, and a frame
+/// the writer took may have reached it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameState {
+    /// The frame is queued and the writer has not taken it yet.
+    Queued,
+    /// The writer took the frame and is writing it to the socket.
+    Transmitting,
+    /// The request gave up before the writer took the frame.
+    Cancelled,
+}
+
+const FRAME_QUEUED: u8 = 0;
+const FRAME_TRANSMITTING: u8 = 1;
+const FRAME_CANCELLED: u8 = 2;
+
+/// The shared lifecycle of one queued frame.
+#[derive(Clone, Debug)]
+pub struct FrameHandle(Arc<AtomicU8>);
+
+impl FrameHandle {
+    pub fn new() -> Self {
+        FrameHandle(Arc::new(AtomicU8::new(FRAME_QUEUED)))
+    }
+    pub fn state(&self) -> FrameState {
+        match self.0.load(Ordering::Acquire) {
+            FRAME_TRANSMITTING => FrameState::Transmitting,
+            FRAME_CANCELLED => FrameState::Cancelled,
+            _ => FrameState::Queued,
+        }
+    }
+    /// The writer takes the frame for transmission.
+    ///
+    /// It returns false when the request was cancelled first, in which case
+    /// the frame must not be written.
+    pub fn claim(&self) -> bool {
+        self.0
+            .compare_exchange(
+                FRAME_QUEUED,
+                FRAME_TRANSMITTING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+    /// The request gave up before the writer took the frame.
+    ///
+    /// It returns false when the writer already took the frame, in which case
+    /// the frame may have reached the instance.
+    pub fn cancel(&self) -> bool {
+        self.0
+            .compare_exchange(
+                FRAME_QUEUED,
+                FRAME_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+    /// Whether the frame may have reached the instance.
+    pub fn may_have_been_transmitted(&self) -> bool {
+        self.state() == FrameState::Transmitting
+    }
+}
+
+impl Default for FrameHandle {
+    fn default() -> Self {
+        FrameHandle::new()
+    }
+}
+
 struct State {
     pending: HashMap<u64, Pending>,
     world: Option<WorldPending>,
@@ -55,6 +133,9 @@ pub enum RequestError {
     Answer(String),
     /// The transport failed. The connection cannot carry another request.
     Transport(String),
+    /// The transport failed before the request's frame was handed to the
+    /// socket: the operation was not applied.
+    NotTransmitted(String),
 }
 
 impl std::fmt::Display for RequestError {
@@ -67,12 +148,24 @@ impl RequestError {
     /// The failure message, whichever kind of failure it is.
     pub fn message(&self) -> &str {
         match self {
-            RequestError::Answer(message) | RequestError::Transport(message) => message,
+            RequestError::Answer(message)
+            | RequestError::Transport(message)
+            | RequestError::NotTransmitted(message) => message,
         }
     }
     /// Whether the failure leaves the connection unusable.
     pub fn is_transport(&self) -> bool {
-        matches!(self, RequestError::Transport(_))
+        matches!(
+            self,
+            RequestError::Transport(_) | RequestError::NotTransmitted(_)
+        )
+    }
+    /// Whether the outcome of the request is unknown.
+    ///
+    /// A request whose frame was never handed to the socket has a known
+    /// outcome: it did not happen.
+    pub fn is_ambiguous(&self) -> bool {
+        !matches!(self, RequestError::NotTransmitted(_))
     }
 }
 
@@ -80,10 +173,11 @@ struct Pending {
     tx: oneshot::Sender<Result<Value, RequestError>>,
     mutation: bool,
     expectation: Expectation,
+    frame: FrameHandle,
 }
 struct WorldPending {
     tx: oneshot::Sender<Result<Value, RequestError>>,
-    sent: bool,
+    frame: FrameHandle,
 }
 struct Inner {
     state: Mutex<State>,
@@ -98,6 +192,7 @@ pub struct PendingRequest {
     id: u64,
     rx: Option<oneshot::Receiver<Result<Value, RequestError>>>,
     inner: Weak<Inner>,
+    frame: FrameHandle,
 }
 
 impl SocketMux {
@@ -138,20 +233,21 @@ impl SocketMux {
             next_id(&self.0, &state)?
         };
         let (tx, rx) = oneshot::channel();
-        let (frame, pending) = match request {
+        let frame = FrameHandle::new();
+        let (frame_text, pending) = match request {
             Request::World => ("420[\"world\"]".to_owned(), None),
             Request::Document {
                 document,
                 action,
                 operation,
             } => {
-                let frame = format!(
+                let frame_text = format!(
                     "42{id}{}",
                     json!(["modifyDocument", {"type":document,"action":action,"operation":operation}])
                 );
                 let mutation = action != "get";
                 (
-                    frame,
+                    frame_text,
                     Some((Expectation::Document { document, action }, mutation)),
                 )
             }
@@ -160,23 +256,26 @@ impl SocketMux {
                 if action == "create" {
                     operation["options"] = json!({});
                 }
-                let frame = format!("42{id}{}", json!(["manageCompendium", operation]));
-                (frame, Some((Expectation::Compendium { action }, true)))
+                let frame_text = format!("42{id}{}", json!(["manageCompendium", operation]));
+                (frame_text, Some((Expectation::Compendium { action }, true)))
             }
             Request::Files {
                 target,
                 kind,
                 extensions,
             } => {
-                let frame = format!(
+                let frame_text = format!(
                     "42{id}{}",
                     json!(["manageFiles", {"action":"browseFiles", "storage":"data", "target":target}, {"type":kind, "extensions":extensions, "wildcard":false, "render":true}])
                 );
-                (frame, Some((Expectation::Files, false)))
+                (frame_text, Some((Expectation::Files, false)))
             }
         };
         if world_request {
-            state.world = Some(WorldPending { tx, sent: false });
+            state.world = Some(WorldPending {
+                tx,
+                frame: frame.clone(),
+            });
         } else {
             let (expectation, mutation) = pending.unwrap();
             state.pending.insert(
@@ -185,6 +284,7 @@ impl SocketMux {
                     tx,
                     mutation,
                     expectation,
+                    frame: frame.clone(),
                 },
             );
         }
@@ -193,8 +293,9 @@ impl SocketMux {
                 id,
                 rx: Some(rx),
                 inner: Arc::downgrade(&self.0),
+                frame,
             },
-            frame,
+            frame_text,
         ))
     }
     /// Dispatch a Socket.IO frame. Returns true when the namespace is no
@@ -260,22 +361,19 @@ impl SocketMux {
         let state = self.0.state.lock().unwrap();
         state.pending.len() + usize::from(state.world.is_some())
     }
-    /// Mark immediately before attempting transport write. Mutation requests are
-    /// conservatively treated as possibly sent from registration onward.
     /// Atomically authorize the transport write against disconnect. Call before
     /// beginning I/O and send only when this returns true.
+    ///
+    /// Authorization is not transmission: the writer takes the frame when it
+    /// writes it, and a request that gives up before that takes the frame
+    /// with it.
     pub fn mark_sent(&self, id: u64) -> bool {
-        let mut state = self.0.state.lock().unwrap();
+        let state = self.0.state.lock().unwrap();
         if state.disconnected {
             return false;
         }
         if id == 0 {
-            if let Some(world) = state.world.as_mut() {
-                world.sent = true;
-                true
-            } else {
-                false
-            }
+            state.world.is_some()
         } else {
             state.pending.contains_key(&id)
         }
@@ -284,20 +382,32 @@ impl SocketMux {
         let mut state = self.0.state.lock().unwrap();
         state.disconnected = true;
         if let Some(world) = state.world.take() {
+            // A world frame the writer never took cannot reach the instance.
+            world.frame.cancel();
             let _ = world
                 .tx
                 .send(Err(RequestError::Transport("socket disconnected".into())));
         }
         state.world_quarantined = false;
         for (_, pending) in state.pending.drain() {
-            let message = if pending.mutation {
-                "socket disconnected; operation may have been applied"
+            // A frame the writer never took cannot reach the instance: the
+            // operation certainly did not happen. A frame the writer took
+            // may have reached it, so the outcome stays unknown.
+            pending.frame.cancel();
+            let error = if pending.frame.may_have_been_transmitted() {
+                RequestError::Transport(if pending.mutation {
+                    "socket disconnected; operation may have been applied".to_owned()
+                } else {
+                    "socket disconnected".to_owned()
+                })
+            } else if pending.mutation {
+                RequestError::NotTransmitted(
+                    "socket disconnected; the operation was not applied".to_owned(),
+                )
             } else {
-                "socket disconnected"
+                RequestError::NotTransmitted("socket disconnected".to_owned())
             };
-            let _ = pending
-                .tx
-                .send(Err(RequestError::Transport(message.into())));
+            let _ = pending.tx.send(Err(error));
         }
     }
 }
@@ -414,13 +524,28 @@ impl PendingRequest {
             .unwrap_or_else(|_| Err(RequestError::Answer("request cancelled".into())))
     }
 }
+impl PendingRequest {
+    /// The lifecycle of the frame this request owns.
+    ///
+    /// The writer takes the frame when it writes it, and the request takes
+    /// it when it gives up: the first of the two decides whether the frame
+    /// can still reach the instance.
+    pub fn frame(&self) -> FrameHandle {
+        self.frame.clone()
+    }
+}
 impl Drop for PendingRequest {
     fn drop(&mut self) {
+        // A request that gives up takes its frame with it: a frame the writer
+        // has not taken must not reach the instance afterwards.
+        self.frame.cancel();
         if let Some(inner) = self.inner.upgrade() {
             let mut state = inner.state.lock().unwrap();
             if self.id == 0 {
                 if let Some(world) = state.world.take() {
-                    state.world_quarantined = world.sent;
+                    // Only a frame the writer took can still be answered by a
+                    // late response.
+                    state.world_quarantined = world.frame.may_have_been_transmitted();
                 }
             } else {
                 state.pending.remove(&self.id);
@@ -530,6 +655,11 @@ mod tests {
         let (world, frame) = mux.begin(Request::World).unwrap();
         assert_eq!(frame, "420[\"world\"]");
         mux.mark_sent(world.id());
+        // The writer took the frame, so the instance may still answer it.
+        assert!(
+            world.frame().claim(),
+            "the writer takes the frame for transmission"
+        );
         drop(world);
         assert!(mux.begin(Request::World).is_err());
         mux.receive("430[{\"world\":{\"title\":\"late\"}}]");
@@ -645,6 +775,10 @@ mod tests {
         drop(unsent);
         let (sent, _) = mux.begin(Request::World).unwrap();
         mux.mark_sent(sent.id());
+        assert!(
+            sent.frame().claim(),
+            "the writer takes the frame for transmission"
+        );
         drop(sent);
         assert!(mux.begin(Request::World).is_err());
         mux.receive("430[{\"world\":{}}]");
@@ -661,6 +795,11 @@ mod tests {
                 operation: json!({}),
             })
             .unwrap();
+        // The writer took the frame, so the instance may have applied it.
+        assert!(
+            mutation.frame().claim(),
+            "the writer takes the frame for transmission"
+        );
         // begin reserves the request before transport I/O; disconnect may race with send completion.
         mux.disconnect();
         assert!(mutation
@@ -727,6 +866,11 @@ mod tests {
                 })
                 .unwrap();
 
+            // The writer took the frame, so the instance may have applied it.
+            assert!(
+                pending.frame().claim(),
+                "the writer takes the frame for transmission"
+            );
             assert!(mux.receive(frame), "{frame} should invalidate the mux");
             assert_eq!(mux.pending_count(), 0, "{frame}");
             assert!(mux.pop_event().is_none(), "{frame} was treated as an event");
@@ -741,7 +885,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disconnect_conservatively_marks_registered_mutation_ambiguous() {
+    async fn disconnect_reports_an_untaken_mutation_as_not_applied() {
         let mux = SocketMux::new(1, 1);
         let (write, _) = mux
             .begin(Request::Document {
@@ -750,10 +894,13 @@ mod tests {
                 operation: json!({}),
             })
             .unwrap();
+        // The writer never took the frame, so the instance cannot have seen
+        // it: the operation certainly did not happen.
         mux.disconnect();
         let error = write.wait().await.unwrap_err();
+        assert!(!error.is_ambiguous(), "the outcome of the request is known");
         let error = error.message().to_owned();
-        assert!(error.contains("may have been applied"), "{error}");
+        assert!(error.contains("the operation was not applied"), "{error}");
     }
 
     #[tokio::test]
@@ -1007,6 +1154,10 @@ mod tests {
             })
             .unwrap();
         mux.mark_sent(write.id());
+        assert!(
+            write.frame().claim(),
+            "the writer takes the frame for transmission"
+        );
         assert!(mux
             .begin(Request::Document {
                 document: "Item".into(),
